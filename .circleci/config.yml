@@ -6,6 +6,7 @@
 #   go-checks    – fmt ▸ vet ▸ golangci-lint ▸ tests (race detector)
 #
 # Publish (only on vX.Y.Z tags):
+#   verify-wasm  – ensures .wasm-source-hash matches current Rust source
 #   publish      – warms Go module proxy ▸ creates GitHub Release with assets
 #
 # The Go job depends on rust-checks so it always tests against a freshly-built
@@ -193,6 +194,53 @@ jobs:
           path: /tmp/test-results
 
   # ╭──────────────────────────────────────────────────────╮
+  # │ Verify: committed WASM source hash is current        │
+  # ╰──────────────────────────────────────────────────────╯
+  # Compares .wasm-source-hash (committed alongside matcher.wasm)
+  # against a hash recomputed from the current Rust source files.
+  # This is environment-independent — no WASM build needed.
+  verify-wasm:
+    docker:
+      - image: cimg/base:current
+    resource_class: small
+    steps:
+      - checkout
+
+      - run:
+          name: Verify WASM source hash
+          command: |
+            if [ ! -f .wasm-source-hash ]; then
+              echo "ERROR: .wasm-source-hash not found."
+              echo "Run 'just wasm' and commit both matcher.wasm and .wasm-source-hash."
+              exit 1
+            fi
+
+            committed=$(cat .wasm-source-hash | tr -d '[:space:]')
+            current=$(cat \
+              $(find rust-wasm/src -type f -name '*.rs' | sort) \
+              rust-wasm/Cargo.toml \
+              rust-wasm/Cargo.lock \
+              | sha256sum | awk '{print $1}')
+
+            echo "Committed hash: $committed"
+            echo "Current hash:   $current"
+
+            if [ "$committed" != "$current" ]; then
+              echo ""
+              echo "╔══════════════════════════════════════════════════════════════╗"
+              echo "║  ERROR: .wasm-source-hash is STALE                          ║"
+              echo "║                                                              ║"
+              echo "║  Rust source has changed since matcher.wasm was last built.  ║"
+              echo "║                                                              ║"
+              echo "║  Fix: run 'just wasm' and commit both matcher.wasm and      ║"
+              echo "║       .wasm-source-hash.                                     ║"
+              echo "╚══════════════════════════════════════════════════════════════╝"
+              exit 1
+            fi
+
+            echo "✓ WASM source hash is up to date."
+
+  # ╭──────────────────────────────────────────────────────╮
   # │ Publish: Go module proxy + GitHub Release            │
   # ╰──────────────────────────────────────────────────────╯
   # Runs only on semver tags (v*). Requires GITHUB_TOKEN env var.
@@ -371,16 +419,20 @@ jobs:
 workflows:
   # ┌─────────────────────────────────────────────────────────────────────────┐
   # │ CI: runs on every push and every tag.                                  │
-  # │ Publish: only runs on semver tags (vX.Y.Z), after CI passes.          │
+  # │ Publish: only runs on semver tags (vX.Y.Z), after CI + verify pass.   │
   # │                                                                        │
   # │   ┌──────────────┐    ┌─────────────┐                                  │
   # │   │ rust-checks  │───▸│  go-checks  │            (every push + tag)    │
   # │   └──────────────┘    └──────┬──────┘                                  │
   # │                              │                                          │
-  # │                              ▼           (tags only: v*)                │
-  # │                   ┌──────────────────┐                                  │
-  # │                   │     publish      │                                  │
-  # │                   └──────────────────┘                                  │
+  # │   ┌──────────────┐           │        (tags only: v*)                   │
+  # │   │ verify-wasm  │           │                                          │
+  # │   └──────┬───────┘           │                                          │
+  # │          │                   │                                          │
+  # │          ▼                   ▼                                          │
+  # │   ┌──────────────────────────────┐                                     │
+  # │   │          publish             │    (tags only: v*)                   │
+  # │   └──────────────────────────────┘                                     │
   # └─────────────────────────────────────────────────────────────────────────┘
   ci:
     jobs:
@@ -397,12 +449,21 @@ workflows:
             tags:
               only: /.*/
 
-      # ── Publish (tags only, after CI green) ──
+      # ── Publish gate: verify WASM source hash (tags only) ──
+      - verify-wasm:
+          filters:
+            tags:
+              only: /^v\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$/
+            branches:
+              ignore: /.*/
+
+      # ── Publish (tags only, after CI + verify green) ──
       - publish:
           context: gh-publish-context
           requires:
             - rust-checks
             - go-checks
+            - verify-wasm
           filters:
             tags:
               only: /^v\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$/

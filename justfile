@@ -3,6 +3,7 @@
 wasm_src := "rust-wasm"
 wasm_target := "wasm32-wasip1"
 wasm_out := "matcher.wasm"
+wasm_hash := ".wasm-source-hash"
 
 # default recipe: build everything
 default: wasm
@@ -12,7 +13,7 @@ default: wasm
 # ---------------------------------------------------------------------------
 
 # compile the rust wasm module and copy to project root
-wasm:
+wasm: _wasm-source-hash
     cd {{wasm_src}} && cargo build --target {{wasm_target}} --release
     cp {{wasm_src}}/target/{{wasm_target}}/release/{{wasm_out}} .
     @ls -lh {{wasm_out}}
@@ -22,6 +23,47 @@ wasm-debug:
     cd {{wasm_src}} && cargo build --target {{wasm_target}}
     cp {{wasm_src}}/target/{{wasm_target}}/debug/{{wasm_out}} .
     @ls -lh {{wasm_out}}
+
+# ---------------------------------------------------------------------------
+# WASM source hash
+# ---------------------------------------------------------------------------
+
+# compute a sha256 hash of all Rust source files that affect the WASM binary.
+# the hash is written to .wasm-source-hash and should be committed alongside
+# matcher.wasm so CI can detect staleness without building.
+_wasm-source-hash:
+    #!/usr/bin/env sh
+    hash=$(cat \
+        $(find {{wasm_src}}/src -type f -name '*.rs' | sort) \
+        {{wasm_src}}/Cargo.toml \
+        {{wasm_src}}/Cargo.lock \
+        | sha256sum | awk '{print $1}')
+    echo "$hash" > {{wasm_hash}}
+    echo "Source hash: $hash"
+
+# verify the committed .wasm-source-hash matches the current Rust source
+verify-wasm-hash:
+    #!/usr/bin/env sh
+    set -e
+    if [ ! -f {{wasm_hash}} ]; then
+        echo "ERROR: {{wasm_hash}} not found. Run 'just wasm' and commit the hash file."
+        exit 1
+    fi
+    committed=$(cat {{wasm_hash}} | tr -d '[:space:]')
+    current=$(cat \
+        $(find {{wasm_src}}/src -type f -name '*.rs' | sort) \
+        {{wasm_src}}/Cargo.toml \
+        {{wasm_src}}/Cargo.lock \
+        | sha256sum | awk '{print $1}')
+    echo "Committed hash: $committed"
+    echo "Current hash:   $current"
+    if [ "$committed" != "$current" ]; then
+        echo ""
+        echo "ERROR: {{wasm_hash}} is stale — Rust source has changed."
+        echo "Fix: run 'just wasm' and commit both {{wasm_out}} and {{wasm_hash}}."
+        exit 1
+    fi
+    echo "✓ WASM source hash is up to date."
 
 # ---------------------------------------------------------------------------
 # Format
@@ -172,11 +214,16 @@ release version:
         exit 1
     fi
 
+    # Ensure WASM source hash is up to date
+    echo "Verifying WASM source hash..."
+    just verify-wasm-hash
+
     # Ensure WASM is up to date
     echo "Rebuilding WASM to verify binary is fresh..."
     just wasm
-    if [ -n "$(git status --porcelain matcher.wasm)" ]; then
-        echo "ERROR: matcher.wasm changed after rebuild. Commit the updated binary first."
+    if [ -n "$(git status --porcelain matcher.wasm .wasm-source-hash)" ]; then
+        echo "ERROR: matcher.wasm or .wasm-source-hash changed after rebuild."
+        echo "Commit the updated files first."
         exit 1
     fi
 
@@ -209,10 +256,10 @@ install-hooks:
     @echo '# Run rust tests' >> .git/hooks/pre-commit
     @echo 'just test-rust' >> .git/hooks/pre-commit
     @echo '' >> .git/hooks/pre-commit
-    @echo '# Rebuild wasm if rust source changed' >> .git/hooks/pre-commit
+    @echo '# Rebuild wasm and regenerate source hash if rust source changed' >> .git/hooks/pre-commit
     @echo 'if git diff --cached --name-only | grep -q "^rust-wasm/"; then' >> .git/hooks/pre-commit
     @echo '    just wasm' >> .git/hooks/pre-commit
-    @echo '    git add matcher.wasm' >> .git/hooks/pre-commit
+    @echo '    git add matcher.wasm .wasm-source-hash' >> .git/hooks/pre-commit
     @echo 'fi' >> .git/hooks/pre-commit
     @echo '' >> .git/hooks/pre-commit
     @echo '# Run go tests' >> .git/hooks/pre-commit
