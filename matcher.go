@@ -2,6 +2,7 @@ package ignore
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"runtime"
 	"strings"
@@ -152,11 +153,11 @@ func (m *Matcher) MatchResult(path string, isDir bool) int {
 // regardless of how many paths are in the slice.
 //
 // Paths ending with "/" are treated as directories for matching purposes.
-func (m *Matcher) Filter(paths []string) []string {
+func (m *Matcher) Filter(paths []string) ([]string, error) {
 	m.mustBeOpen()
 
 	if len(paths) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	return batchFilterOnInstance(m.eng, m.inst, m.handle, paths)
@@ -164,59 +165,64 @@ func (m *Matcher) Filter(paths []string) []string {
 
 // batchFilterOnInstance runs batch_filter on a specific instance/handle and
 // returns the kept paths. Used by both Filter and FilterParallel workers.
-func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths []string) []string {
+func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths []string) ([]string, error) {
 	blob := strings.Join(paths, "\n")
 
 	pathsPtr, pathsSize, err := eng.writeString(inst, blob)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("ignore: failed to write paths to wasm memory: %w", err)
 	}
 	defer eng.freeBytes(inst, pathsPtr, pathsSize)
 
 	// Allocate 8 bytes for the result info (result_ptr: i32, result_len: i32).
 	infoResults, err := inst.fnAlloc.Call(eng.ctx, 8)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("ignore: failed to allocate result info buffer: %w", err)
 	}
 	infoPtr := uint32(infoResults[0])
 	if infoPtr == 0 {
-		return nil
+		return nil, fmt.Errorf("ignore: alloc returned null for result info buffer (out of memory)")
 	}
 	defer eng.freeBytes(inst, infoPtr, 8)
 
 	results, err := inst.fnBatchFilter.Call(eng.ctx,
 		uint64(handle), uint64(pathsPtr), uint64(pathsSize), uint64(infoPtr))
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("ignore: batch_filter call failed: %w", err)
 	}
 
 	count := int32(results[0])
-	if count <= 0 {
-		// count == 0 means nothing was kept; count == -1 means error.
-		return nil
+	if count == -1 {
+		return nil, fmt.Errorf("ignore: batch_filter returned error (invalid handle or input)")
+	}
+	if count == 0 {
+		// Legitimate result: all paths were filtered out.
+		return nil, nil
 	}
 
 	// Read result pointer and length from the info buffer.
 	infoBuf, ok := inst.mod.Memory().Read(infoPtr, 8)
 	if !ok {
-		return nil
+		return nil, fmt.Errorf("ignore: failed to read result info from wasm memory (ptr=%d, mem=%d)",
+			infoPtr, inst.mod.Memory().Size())
 	}
 
 	resultPtr := binary.LittleEndian.Uint32(infoBuf[0:4])
 	resultLen := binary.LittleEndian.Uint32(infoBuf[4:8])
 
 	if resultPtr == 0 || resultLen == 0 {
-		return nil
+		// Defensive: count > 0 but no result buffer — treat as error.
+		return nil, fmt.Errorf("ignore: batch_filter reported %d kept paths but result buffer is empty", count)
 	}
 
 	// Read the result blob and free it.
 	resultBytes, err := eng.readBytes(inst, resultPtr, resultLen)
-	eng.freeBytes(inst, resultPtr, resultLen) // always free, even on error
+	eng.freeBytes(inst, resultPtr, resultLen) // always free, even on read error
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("ignore: failed to read batch_filter result from wasm memory: %w", err)
 	}
 
-	return strings.Split(string(resultBytes), "\n")
+	return strings.Split(string(resultBytes), "\n"), nil
 }
 
 // FilterParallel returns only the paths that are NOT ignored, using multiple
@@ -229,11 +235,11 @@ func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths
 //
 // For small path lists (< 10k), the parallelism overhead may exceed the
 // savings. Use Filter for small lists.
-func (m *Matcher) FilterParallel(paths []string) []string {
+func (m *Matcher) FilterParallel(paths []string) ([]string, error) {
 	m.mustBeOpen()
 
 	if len(paths) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	numWorkers := runtime.NumCPU()
@@ -265,15 +271,16 @@ func (m *Matcher) FilterParallel(paths []string) []string {
 	}
 	numWorkers = len(chunks) // actual number of chunks may be less
 
-	// Worker state: one slot per chunk for its results.
-	results := make([][]string, numWorkers)
+	// Worker state: one slot per chunk for its results and errors.
+	resultSlices := make([][]string, numWorkers)
+	errs := make([]error, numWorkers)
 	var wg sync.WaitGroup
 	wg.Add(numWorkers)
 
 	// Chunk 0 uses the Matcher's own instance.
 	go func() {
 		defer wg.Done()
-		results[0] = batchFilterOnInstance(m.eng, m.inst, m.handle, chunks[0].paths)
+		resultSlices[0], errs[0] = batchFilterOnInstance(m.eng, m.inst, m.handle, chunks[0].paths)
 	}()
 
 	// Chunks 1..N-1 borrow temporary instances from the pool.
@@ -283,32 +290,48 @@ func (m *Matcher) FilterParallel(paths []string) []string {
 
 			inst, err := m.eng.getInstance()
 			if err != nil {
+				errs[idx] = fmt.Errorf("ignore: FilterParallel worker %d: failed to get instance: %w", idx, err)
 				return
 			}
 			defer m.eng.putInstance(inst)
 
 			handle, err := createMatcherOnInstance(m.eng, inst, m.patterns)
 			if err != nil {
+				errs[idx] = fmt.Errorf("ignore: FilterParallel worker %d: failed to create matcher: %w", idx, err)
 				return
 			}
 			defer destroyMatcherOnInstance(m.eng, inst, handle)
 
-			results[idx] = batchFilterOnInstance(m.eng, inst, handle, chunks[idx].paths)
+			resultSlices[idx], errs[idx] = batchFilterOnInstance(m.eng, inst, handle, chunks[idx].paths)
+			if errs[idx] != nil {
+				errs[idx] = fmt.Errorf("ignore: FilterParallel worker %d: %w", idx, errs[idx])
+			}
 		}(i)
 	}
 
 	wg.Wait()
 
+	// Collect any worker errors.
+	var joinedErr error
+	for _, err := range errs {
+		if err != nil {
+			joinedErr = errors.Join(joinedErr, err)
+		}
+	}
+	if joinedErr != nil {
+		return nil, joinedErr
+	}
+
 	// Merge results in order.
 	total := 0
-	for _, r := range results {
+	for _, r := range resultSlices {
 		total += len(r)
 	}
 	merged := make([]string, 0, total)
-	for _, r := range results {
+	for _, r := range resultSlices {
 		merged = append(merged, r...)
 	}
-	return merged
+	return merged, nil
 }
 
 // Close destroys the compiled matcher and returns the WASM instance to the pool

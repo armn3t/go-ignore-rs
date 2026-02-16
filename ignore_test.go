@@ -357,7 +357,10 @@ func TestFilterBasic(t *testing.T) {
 		"README.md",
 	}
 
-	got := m.Filter(paths)
+	got, err := m.Filter(paths)
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
 	want := []string{"src/main.go", "README.md"}
 
 	assertStringSliceEqual(t, got, want)
@@ -370,7 +373,10 @@ func TestFilterWithNegation(t *testing.T) {
 	}
 	defer m.Close()
 
-	got := m.Filter([]string{"debug.log", "important.log", "error.log", "src/main.go"})
+	got, err := m.Filter([]string{"debug.log", "important.log", "error.log", "src/main.go"})
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
 	want := []string{"important.log", "src/main.go"}
 
 	assertStringSliceEqual(t, got, want)
@@ -383,7 +389,10 @@ func TestFilterAllIgnored(t *testing.T) {
 	}
 	defer m.Close()
 
-	got := m.Filter([]string{"a.txt", "b.txt", "c.txt"})
+	got, err := m.Filter([]string{"a.txt", "b.txt", "c.txt"})
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
 	if len(got) != 0 {
 		t.Errorf("expected empty result, got %v", got)
 	}
@@ -397,7 +406,10 @@ func TestFilterNoneIgnored(t *testing.T) {
 	defer m.Close()
 
 	input := []string{"a.txt", "b.rs", "c.go"}
-	got := m.Filter(input)
+	got, err := m.Filter(input)
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
 
 	assertStringSliceEqual(t, got, input)
 }
@@ -409,7 +421,10 @@ func TestFilterEmptyInput(t *testing.T) {
 	}
 	defer m.Close()
 
-	got := m.Filter([]string{})
+	got, err := m.Filter([]string{})
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
 	if got != nil {
 		t.Errorf("expected nil, got %v", got)
 	}
@@ -422,7 +437,10 @@ func TestFilterPreservesOrder(t *testing.T) {
 	}
 	defer m.Close()
 
-	got := m.Filter([]string{"z.txt", "a.txt", "m.txt", "debug.log", "b.txt"})
+	got, err := m.Filter([]string{"z.txt", "a.txt", "m.txt", "debug.log", "b.txt"})
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
 	want := []string{"z.txt", "a.txt", "m.txt", "b.txt"}
 
 	assertStringSliceEqual(t, got, want)
@@ -435,11 +453,14 @@ func TestFilterDirectoryDetection(t *testing.T) {
 	}
 	defer m.Close()
 
-	got := m.Filter([]string{
+	got, err := m.Filter([]string{
 		"build/",    // trailing slash → directory → should be filtered
 		"build",     // no slash → file → should be kept
 		"src/main.go",
 	})
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
 	want := []string{"build", "src/main.go"}
 
 	assertStringSliceEqual(t, got, want)
@@ -482,7 +503,10 @@ func TestFilterLargePatternSet(t *testing.T) {
 		"tests/test_main.rs",
 	}
 
-	got := m.Filter(paths)
+	got, err := m.Filter(paths)
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
 	want := []string{
 		"src/main.rs",
 		"src/lib.rs",
@@ -514,7 +538,10 @@ func TestFilterParallelBasic(t *testing.T) {
 		"README.md",
 	}
 
-	got := m.FilterParallel(paths)
+	got, err := m.FilterParallel(paths)
+	if err != nil {
+		t.Fatalf("FilterParallel failed: %v", err)
+	}
 	want := []string{"src/main.go", "README.md"}
 
 	assertStringSliceEqual(t, got, want)
@@ -527,7 +554,10 @@ func TestFilterParallelEmpty(t *testing.T) {
 	}
 	defer m.Close()
 
-	got := m.FilterParallel([]string{})
+	got, err := m.FilterParallel([]string{})
+	if err != nil {
+		t.Fatalf("FilterParallel failed: %v", err)
+	}
 	if got != nil {
 		t.Errorf("expected nil, got %v", got)
 	}
@@ -553,7 +583,10 @@ func TestFilterParallelPreservesOrder(t *testing.T) {
 		}
 	}
 
-	got := m.FilterParallel(paths)
+	got, err := m.FilterParallel(paths)
+	if err != nil {
+		t.Fatalf("FilterParallel failed: %v", err)
+	}
 
 	assertStringSliceEqual(t, got, wantKept)
 }
@@ -590,8 +623,14 @@ func TestFilterParallelMatchesFilter(t *testing.T) {
 		}
 	}
 
-	sequential := m1.Filter(paths)
-	parallel := m2.FilterParallel(paths)
+	sequential, err := m1.Filter(paths)
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
+	parallel, err := m2.FilterParallel(paths)
+	if err != nil {
+		t.Fatalf("FilterParallel failed: %v", err)
+	}
 
 	assertStringSliceEqual(t, parallel, sequential)
 }
@@ -670,7 +709,11 @@ func TestConcurrentFilterParallel(t *testing.T) {
 			}
 			defer m.Close()
 
-			got := m.FilterParallel(paths)
+			got, err := m.FilterParallel(paths)
+			if err != nil {
+				errors <- fmt.Errorf("goroutine %d: FilterParallel failed: %w", id, err)
+				return
+			}
 
 			for _, p := range got {
 				if strings.HasSuffix(p, ".log") {
@@ -778,7 +821,10 @@ func TestRealWorldGitignore(t *testing.T) {
 		"docs/guide.md",
 		".gitkeep",
 	}
-	got := m.Filter(paths)
+	got, err := m.Filter(paths)
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
 	want := []string{
 		"src/main.rs",
 		"src/lib.rs",
@@ -853,7 +899,9 @@ func BenchmarkFilter100(b *testing.B) {
 
 	b.ResetTimer()
 	for b.Loop() {
-		m.Filter(paths)
+		if _, err := m.Filter(paths); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -876,7 +924,9 @@ func BenchmarkFilter10000(b *testing.B) {
 
 	b.ResetTimer()
 	for b.Loop() {
-		m.Filter(paths)
+		if _, err := m.Filter(paths); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -899,7 +949,9 @@ func BenchmarkFilterParallel10000(b *testing.B) {
 
 	b.ResetTimer()
 	for b.Loop() {
-		m.FilterParallel(paths)
+		if _, err := m.FilterParallel(paths); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

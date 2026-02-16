@@ -17,7 +17,7 @@
 //	fmt.Println(m.Match("important.log")) // false (whitelisted)
 //	fmt.Println(m.Match("src/main.go"))   // false (not matched)
 //
-//	kept := m.Filter([]string{"debug.log", "important.log", "src/main.go"})
+//	kept, err := m.Filter([]string{"debug.log", "important.log", "src/main.go"})
 //	// kept == []string{"important.log", "src/main.go"}
 //
 // # Concurrency
@@ -30,7 +30,7 @@
 // For large path lists (> 1M paths), use FilterParallel which splits the work
 // across multiple WASM instances in parallel:
 //
-//	kept := m.FilterParallel(millionsOfPaths)
+//	kept, err := m.FilterParallel(millionsOfPaths)
 //
 // # Pattern Syntax
 //
