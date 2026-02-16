@@ -13,7 +13,9 @@
 # WASM binary rather than the one committed to the repo.
 #
 # ┌─────────────────────────────────────────────────────────────────────────┐
-# │ REQUIRED SECRETS (set in CircleCI project settings or a context):      │
+# │ REQUIRED CONTEXT: gh-publish-context                                   │
+# │                                                                        │
+# │   Create this context in CircleCI and add the following env var:       │
 # │                                                                        │
 # │   GITHUB_TOKEN  – GitHub personal access token (or fine-grained token) │
 # │                   with "Contents: read+write" permission on the repo.  │
@@ -414,6 +416,7 @@ workflows:
 
       # ── Publish (tags only, after everything green) ──
       - publish:
+          context: gh-publish-context
           requires:
             - rust-checks
             - go-checks
