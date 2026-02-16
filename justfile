@@ -40,8 +40,11 @@ fmt:
     cd {{wasm_src}} && cargo fmt
     cd {{wasm_src}} && cargo clippy --target {{wasm_target}} -- -D warnings
 
+# run all tests (rust + go)
+test-all: test-rust test
+
 # build everything and run all tests
-all: wasm test
+all: wasm test-all
 
 # remove all build artifacts
 clean:
