@@ -121,10 +121,24 @@ pub extern "C" fn dealloc(ptr: i32, size: i32) {
 // Matcher lifecycle exports
 // ---------------------------------------------------------------------------
 
-/// Create a matcher from newline-separated gitignore patterns stored at
-/// `patterns_ptr` for `patterns_len` bytes in WASM memory.
+/// Creates a gitignore matcher from newline-separated patterns stored in WASM memory.
 ///
-/// Returns a handle ID (> 0) on success, or 0 on error.
+/// The function reads `patterns_len` bytes starting at `patterns_ptr` as UTF-8 text and compiles
+/// those newline-separated patterns into a matcher. If `patterns_len` is 0, an empty matcher is
+/// created (the pointer may be 0 in that case). If `patterns_len` > 0, `patterns_ptr` must be
+/// non-zero and the bytes must be valid UTF-8; otherwise the call fails.
+///
+/// # Returns
+///
+/// A positive handle id (> 0) identifying the created matcher on success, or `0` on error.
+///
+/// # Examples
+///
+/// ```
+/// // Create an empty matcher
+/// let handle = unsafe { create_matcher(0, 0) };
+/// assert!(handle > 0);
+/// ```
 #[no_mangle]
 pub extern "C" fn create_matcher(patterns_ptr: i32, patterns_len: i32) -> i32 {
     if patterns_len < 0 {
