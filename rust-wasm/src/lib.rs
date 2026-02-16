@@ -127,16 +127,23 @@ pub extern "C" fn dealloc(ptr: i32, size: i32) {
 /// Returns a handle ID (> 0) on success, or 0 on error.
 #[no_mangle]
 pub extern "C" fn create_matcher(patterns_ptr: i32, patterns_len: i32) -> i32 {
-    if patterns_ptr == 0 || patterns_len < 0 {
+    if patterns_len < 0 {
         return 0;
     }
 
-    let bytes =
-        unsafe { std::slice::from_raw_parts(patterns_ptr as *const u8, patterns_len as usize) };
-
-    let text = match std::str::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => return 0,
+    // Empty patterns (ptr=0, len=0) are valid — produce an empty matcher.
+    let text = if patterns_len == 0 {
+        ""
+    } else {
+        if patterns_ptr == 0 {
+            return 0;
+        }
+        let bytes =
+            unsafe { std::slice::from_raw_parts(patterns_ptr as *const u8, patterns_len as usize) };
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        }
     };
 
     let gitignore = match build_matcher(text) {
