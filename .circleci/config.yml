@@ -194,10 +194,15 @@ jobs:
           path: /tmp/test-results
 
   # ╭──────────────────────────────────────────────────────╮
-  # │ Verify: committed WASM matches freshly-built binary  │
+  # │ Verify: committed WASM is not stale                  │
   # ╰──────────────────────────────────────────────────────╯
-  # This gate prevents publishing a tag where someone changed
-  # Rust source but forgot to rebuild & commit matcher.wasm.
+  # Uses git history (not binary comparison) to detect staleness.
+  # Binary comparison is unreliable because WASM builds are not
+  # perfectly reproducible across environments (linker, libs, etc.).
+  #
+  # Instead, we check whether any Rust source files were modified
+  # after the commit that last touched matcher.wasm. If so, someone
+  # forgot to rebuild.
   verify-wasm:
     docker:
       - image: cimg/base:current
@@ -205,45 +210,42 @@ jobs:
     steps:
       - checkout
 
-      # ── Record the committed binary's checksum ──
       - run:
-          name: Checksum committed matcher.wasm
+          name: Verify matcher.wasm is not stale
           command: |
-            echo "Committed matcher.wasm:"
-            sha256sum matcher.wasm | tee /tmp/committed-wasm.sha256
-
-      # ── Overwrite with the freshly-built binary from rust-checks ──
-      - attach_workspace:
-          at: /tmp/workspace
-
-      # ── Compare ──
-      - run:
-          name: Compare committed vs freshly-built WASM
-          command: |
-            echo "Freshly-built matcher.wasm:"
-            sha256sum /tmp/workspace/matcher.wasm | tee /tmp/built-wasm.sha256
+            echo "Checking git history for Rust source changes since last WASM update..."
             echo ""
 
-            committed=$(awk '{print $1}' /tmp/committed-wasm.sha256)
-            built=$(awk '{print $1}' /tmp/built-wasm.sha256)
+            # Find the commit that last touched matcher.wasm
+            last_wasm_commit=$(git log -1 --format="%H" -- matcher.wasm)
+            if [ -z "$last_wasm_commit" ]; then
+              echo "ERROR: matcher.wasm has no git history — was it ever committed?"
+              exit 1
+            fi
+            echo "Last matcher.wasm update: $(git log -1 --format='%h %s' -- matcher.wasm)"
 
-            if [ "$committed" != "$built" ]; then
+            # Check if any Rust source files changed between that commit and HEAD
+            rust_changes=$(git diff --name-only "$last_wasm_commit" HEAD -- \
+              rust-wasm/src/ \
+              rust-wasm/Cargo.toml \
+              rust-wasm/Cargo.lock)
+
+            if [ -n "$rust_changes" ]; then
               echo ""
               echo "╔══════════════════════════════════════════════════════════════╗"
               echo "║  ERROR: committed matcher.wasm is STALE                     ║"
               echo "║                                                              ║"
-              echo "║  The Rust source has changed but the WASM binary checked     ║"
-              echo "║  into the repo was not rebuilt.                               ║"
-              echo "║                                                              ║"
-              echo "║  Fix: run 'just wasm' locally and commit the updated binary. ║"
+              echo "║  The following Rust source files changed after the last      ║"
+              echo "║  matcher.wasm commit:                                        ║"
               echo "╚══════════════════════════════════════════════════════════════╝"
               echo ""
-              echo "  committed: $committed"
-              echo "  built:     $built"
+              echo "$rust_changes"
+              echo ""
+              echo "Fix: run 'just wasm' locally and commit the updated binary."
               exit 1
             fi
 
-            echo "✓ matcher.wasm is up to date with Rust source."
+            echo "✓ No Rust source changes since last matcher.wasm commit."
 
   # ╭──────────────────────────────────────────────────────╮
   # │ Publish: Go module proxy + GitHub Release            │
@@ -271,6 +273,57 @@ jobs:
               exit 1
             fi
             echo "✓ Tag is valid semver."
+
+      # ── Verify version is not a regression ──
+      - run:
+          name: Check for version regression
+          command: |
+            # Find the latest existing semver tag (excluding the current one)
+            latest=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname \
+              | grep -v "^${CIRCLE_TAG}$" | head -n1)
+
+            if [ -z "$latest" ]; then
+              echo "No previous release tags found. This is the first release."
+              exit 0
+            fi
+
+            echo "Current tag:  $CIRCLE_TAG"
+            echo "Latest tag:   $latest"
+
+            # Strip leading 'v' and any pre-release/build suffix for numeric comparison
+            latest_core=$(echo "$latest" | sed 's/^v//; s/[-+].*//')
+            new_core=$(echo "$CIRCLE_TAG" | sed 's/^v//; s/[-+].*//')
+
+            latest_major=$(echo "$latest_core" | cut -d. -f1)
+            latest_minor=$(echo "$latest_core" | cut -d. -f2)
+            latest_patch=$(echo "$latest_core" | cut -d. -f3)
+
+            new_major=$(echo "$new_core" | cut -d. -f1)
+            new_minor=$(echo "$new_core" | cut -d. -f2)
+            new_patch=$(echo "$new_core" | cut -d. -f3)
+
+            is_greater=false
+            if [ "$new_major" -gt "$latest_major" ]; then
+              is_greater=true
+            elif [ "$new_major" -eq "$latest_major" ]; then
+              if [ "$new_minor" -gt "$latest_minor" ]; then
+                is_greater=true
+              elif [ "$new_minor" -eq "$latest_minor" ]; then
+                if [ "$new_patch" -gt "$latest_patch" ]; then
+                  is_greater=true
+                fi
+              fi
+            fi
+
+            if [ "$is_greater" = false ]; then
+              echo ""
+              echo "ERROR: $CIRCLE_TAG is not greater than $latest"
+              echo "  latest:  ${latest_major}.${latest_minor}.${latest_patch}"
+              echo "  new:     ${new_major}.${new_minor}.${new_patch}"
+              exit 1
+            fi
+
+            echo "✓ $CIRCLE_TAG > $latest"
 
       # ── Verify go.mod module path is correct ──
       - run:
@@ -377,12 +430,11 @@ workflows:
   # │                                                                        │
   # │   ┌──────────────┐    ┌─────────────┐                                  │
   # │   │ rust-checks  │───▸│  go-checks  │            (every push + tag)    │
-  # │   └──────┬───────┘    └──────┬──────┘                                  │
-  # │          │                   │                                          │
-  # │          ▼                   │        (tags only: v*)                   │
-  # │   ┌──────────────┐          │                                          │
-  # │   │ verify-wasm  │          │                                          │
-  # │   └──────┬───────┘          │                                          │
+  # │   └──────────────┘    └──────┬──────┘                                  │
+  # │                              │                                          │
+  # │   ┌──────────────┐           │        (tags only: v*)                   │
+  # │   │ verify-wasm  │           │                                          │
+  # │   └──────┬───────┘           │                                          │
   # │          │                   │                                          │
   # │          ▼                   ▼                                          │
   # │   ┌──────────────────────────────┐                                     │
@@ -405,9 +457,8 @@ workflows:
               only: /.*/
 
       # ── Publish gate: verify WASM is fresh (tags only) ──
+      # Uses git history only — no workspace needed.
       - verify-wasm:
-          requires:
-            - rust-checks
           filters:
             tags:
               only: /^v\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$/

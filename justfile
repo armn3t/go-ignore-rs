@@ -116,6 +116,56 @@ release version:
         exit 1
     fi
 
+    # Check that this tag doesn't already exist
+    if git rev-parse "$tag" >/dev/null 2>&1; then
+        echo "ERROR: tag '$tag' already exists."
+        exit 1
+    fi
+
+    # Compare against the latest existing semver tag to prevent version regression.
+    # Splits "vMAJOR.MINOR.PATCH" into three integers and compares lexicographically.
+    latest=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n1)
+    if [ -n "$latest" ]; then
+        echo "Latest existing tag: $latest"
+
+        # Strip leading 'v' and any pre-release/build suffix for numeric comparison
+        latest_core=$(echo "$latest" | sed 's/^v//; s/[-+].*//')
+        new_core=$(echo "{{version}}" | sed 's/[-+].*//')
+
+        latest_major=$(echo "$latest_core" | cut -d. -f1)
+        latest_minor=$(echo "$latest_core" | cut -d. -f2)
+        latest_patch=$(echo "$latest_core" | cut -d. -f3)
+
+        new_major=$(echo "$new_core" | cut -d. -f1)
+        new_minor=$(echo "$new_core" | cut -d. -f2)
+        new_patch=$(echo "$new_core" | cut -d. -f3)
+
+        # Compare: new must be strictly greater than latest
+        is_greater=false
+        if [ "$new_major" -gt "$latest_major" ]; then
+            is_greater=true
+        elif [ "$new_major" -eq "$latest_major" ]; then
+            if [ "$new_minor" -gt "$latest_minor" ]; then
+                is_greater=true
+            elif [ "$new_minor" -eq "$latest_minor" ]; then
+                if [ "$new_patch" -gt "$latest_patch" ]; then
+                    is_greater=true
+                fi
+            fi
+        fi
+
+        if [ "$is_greater" = false ]; then
+            echo "ERROR: version '{{version}}' is not greater than latest release '${latest}'."
+            echo "  latest:  ${latest_major}.${latest_minor}.${latest_patch}"
+            echo "  new:     ${new_major}.${new_minor}.${new_patch}"
+            exit 1
+        fi
+
+        echo "✓ v{{version}} > $latest"
+    else
+        echo "No previous release tags found. This will be the first release."
+    fi
+
     # Ensure working tree is clean
     if [ -n "$(git status --porcelain)" ]; then
         echo "ERROR: working tree is dirty. Commit or stash changes first."
