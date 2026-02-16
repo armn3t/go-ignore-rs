@@ -46,9 +46,10 @@ fmt: fmt-rust fmt-go
 lint-rust:
     cd {{wasm_src}} && cargo clippy --target {{wasm_target}} -- -D warnings
 
-# lint go code with go vet
+# lint go code with go vet and golangci-lint
 lint-go:
     go vet ./...
+    golangci-lint run ./...
 
 # lint all code
 lint: lint-rust lint-go
@@ -67,6 +68,7 @@ check-go:
     @echo "Checking go formatting..."
     @test -z "$(gofmt -l .)" || (echo "Go files need formatting:"; gofmt -l .; exit 1)
     go vet ./...
+    golangci-lint run ./...
 
 # check all formatting and lint (does not modify files)
 check: check-rust check-go
