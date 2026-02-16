@@ -26,10 +26,13 @@ const MatchWhitelist = 2
 // Close must be called when the Matcher is no longer needed. This destroys the
 // compiled patterns and returns the WASM instance to the pool for reuse.
 type Matcher struct {
-	eng      *engine
-	inst     *wasmInstance
-	handle   uint32
-	patterns string // stored so FilterParallel can compile on borrowed instances
+	eng    *engine
+	inst   *wasmInstance
+	handle uint32
+	// patterns is the newline-joined pattern string passed to NewMatcher. It is
+	// retained so that FilterParallel can compile the same pattern set on each
+	// additional borrowed instance without requiring the caller to pass it again.
+	patterns string
 	closed   bool
 }
 
@@ -107,12 +110,20 @@ func destroyMatcherOnInstance(eng *engine, inst *wasmInstance, handle uint32) {
 //
 // For matching directory paths, use MatchDir instead. For checking large numbers
 // of paths, prefer Filter or FilterParallel which use batch FFI.
+//
+// On an internal WASM error, Match returns false (not ignored). This means errors
+// are indistinguishable from a non-matching result at this API level. If your
+// use case requires detecting WASM errors, call MatchResult directly and check
+// for a return value of -1.
 func (m *Matcher) Match(path string) bool {
 	return m.MatchResult(path, false) == MatchIgnore
 }
 
 // MatchDir reports whether the given directory path is ignored by the compiled
 // patterns.
+//
+// On an internal WASM error, MatchDir returns false (not ignored). See Match
+// for details on error handling.
 func (m *Matcher) MatchDir(path string) bool {
 	return m.MatchResult(path, true) == MatchIgnore
 }
@@ -235,6 +246,12 @@ func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths
 //
 // For small path lists (< 10k), the parallelism overhead may exceed the
 // savings. Use Filter for small lists.
+//
+// Note: on each call to FilterParallel, the pattern set is re-compiled on each
+// worker instance (chunks 1..N-1). This compilation cost (~1–10µs per worker)
+// is paid on every call, not just the first. It is negligible compared to the
+// matching time saved on large path lists, but for repeated calls on small lists
+// the overhead accumulates — prefer Filter in that case.
 func (m *Matcher) FilterParallel(paths []string) ([]string, error) {
 	m.mustBeOpen()
 

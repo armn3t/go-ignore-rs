@@ -139,6 +139,11 @@ func (e *engine) getInstance() (*wasmInstance, error) {
 
 // putInstance returns a bare WASM instance to the pool for reuse.
 // The caller must ensure all matchers on this instance have been destroyed.
+//
+// Note: WASM linear memory grows on demand but never shrinks. An instance that
+// processed a very large path batch will retain its expanded memory footprint
+// when returned to the pool. Under GC pressure sync.Pool evicts idle entries,
+// which reclaims that memory automatically.
 func (e *engine) putInstance(inst *wasmInstance) {
 	e.pool.Put(inst)
 }

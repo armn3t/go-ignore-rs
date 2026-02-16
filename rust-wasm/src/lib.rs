@@ -4,6 +4,15 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+// NOTE: NEXT_ID is per-instance and increments monotonically for the lifetime of
+// the WASM instance. Wraparound after ~4 billion creates on a single instance is
+// effectively impossible in practice. At the theoretical wrap point, when the
+// counter reaches u32::MAX the returned `id as i32` equals -1. The host (Go) casts
+// this to uint32 and sees a non-zero value, so it treats it as a valid handle. The
+// entry is inserted into MATCHERS, but is_match and batch_filter both reject
+// `handle <= 0`, so that entry is permanently orphaned until the instance is
+// destroyed. The next create after the wrap produces id = 0, which create_matcher
+// returns as 0 and the host correctly treats as an error.
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
 // SAFETY: WASM is single-threaded — there is only one thread of execution,
