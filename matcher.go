@@ -42,7 +42,7 @@ type Matcher struct {
 //   - "build/"         matches the build directory
 //   - "!important.log" negates a previous pattern
 //   - Lines starting with # are comments
-//   - Empty lines are ignored
+// On error the borrowed instance is returned to the pool and the error is propagated.
 func NewMatcher(patterns []string) (*Matcher, error) {
 	eng, err := getEngine()
 	if err != nil {
@@ -72,7 +72,8 @@ func NewMatcher(patterns []string) (*Matcher, error) {
 
 // createMatcherOnInstance compiles a newline-joined pattern string on a WASM
 // instance and returns the handle. This is used by both NewMatcher and
-// FilterParallel (for temporary workers).
+// createMatcherOnInstance compiles the provided pattern set on the given WASM instance and returns a non-zero matcher handle.
+// It allocates instance memory for the patterns (which is freed before returning) and returns an error if the WASM call fails or if the compiled matcher handle is 0.
 func createMatcherOnInstance(eng *engine, inst *wasmInstance, patterns string) (uint32, error) {
 	ptr, size, err := eng.writeString(inst, patterns)
 	if err != nil {
@@ -94,7 +95,8 @@ func createMatcherOnInstance(eng *engine, inst *wasmInstance, patterns string) (
 }
 
 // destroyMatcherOnInstance removes a matcher from a WASM instance's internal
-// state.
+// destroyMatcherOnInstance destroys the matcher identified by handle in the given WASM instance.
+// If handle is 0 the call is a no-op.
 func destroyMatcherOnInstance(eng *engine, inst *wasmInstance, handle uint32) {
 	if handle == 0 {
 		return
@@ -163,7 +165,8 @@ func (m *Matcher) Filter(paths []string) []string {
 }
 
 // batchFilterOnInstance runs batch_filter on a specific instance/handle and
-// returns the kept paths. Used by both Filter and FilterParallel workers.
+// batchFilterOnInstance runs the batch filter function in the provided WASM instance for the given matcher handle and input paths, returning the kept paths.
+// It returns a slice of paths that were not ignored, or nil if nothing was kept or an error occurred while invoking the WASM instance.
 func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths []string) []string {
 	blob := strings.Join(paths, "\n")
 

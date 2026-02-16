@@ -51,7 +51,9 @@ var (
 )
 
 // getEngine returns the package-level engine singleton, initializing it on
-// first call. The WASM module is compiled once and reused for all instances.
+// getEngine initializes and returns the package-level engine singleton.
+// On the first invocation it constructs the engine via newEngine and caches the result;
+// subsequent calls return the cached instance. It returns the engine and any error encountered during initialization.
 func getEngine() (*engine, error) {
 	engineOnce.Do(func() {
 		globalEngine, engineErr = newEngine()
@@ -59,6 +61,11 @@ func getEngine() (*engine, error) {
 	return globalEngine, engineErr
 }
 
+// newEngine creates and initializes an engine that compiles the embedded matcher WASM
+// module, instantiates WASI, and prepares a sync.Pool for reusable wasmInstance objects.
+// On compilation failure the created runtime is closed and an error is returned.
+// The pool's New function attempts to create new instances and returns nil on instance
+// creation failure so callers can fall back to direct creation.
 func newEngine() (*engine, error) {
 	ctx := context.Background()
 
