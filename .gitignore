@@ -1,0 +1,21 @@
+# Rust build artifacts
+rust-wasm/target/
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# The compiled WASM binary is checked in intentionally.
+# Do NOT add matcher.wasm to this gitignore.
