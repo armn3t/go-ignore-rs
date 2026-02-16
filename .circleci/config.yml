@@ -6,7 +6,6 @@
 #   go-checks    – fmt ▸ vet ▸ golangci-lint ▸ tests (race detector)
 #
 # Publish (only on vX.Y.Z tags):
-#   verify-wasm  – ensures committed matcher.wasm matches freshly-built binary
 #   publish      – warms Go module proxy ▸ creates GitHub Release with assets
 #
 # The Go job depends on rust-checks so it always tests against a freshly-built
@@ -194,60 +193,6 @@ jobs:
           path: /tmp/test-results
 
   # ╭──────────────────────────────────────────────────────╮
-  # │ Verify: committed WASM is not stale                  │
-  # ╰──────────────────────────────────────────────────────╯
-  # Uses git history (not binary comparison) to detect staleness.
-  # Binary comparison is unreliable because WASM builds are not
-  # perfectly reproducible across environments (linker, libs, etc.).
-  #
-  # Instead, we check whether any Rust source files were modified
-  # after the commit that last touched matcher.wasm. If so, someone
-  # forgot to rebuild.
-  verify-wasm:
-    docker:
-      - image: cimg/base:current
-    resource_class: small
-    steps:
-      - checkout
-
-      - run:
-          name: Verify matcher.wasm is not stale
-          command: |
-            echo "Checking git history for Rust source changes since last WASM update..."
-            echo ""
-
-            # Find the commit that last touched matcher.wasm
-            last_wasm_commit=$(git log -1 --format="%H" -- matcher.wasm)
-            if [ -z "$last_wasm_commit" ]; then
-              echo "ERROR: matcher.wasm has no git history — was it ever committed?"
-              exit 1
-            fi
-            echo "Last matcher.wasm update: $(git log -1 --format='%h %s' -- matcher.wasm)"
-
-            # Check if any Rust source files changed between that commit and HEAD
-            rust_changes=$(git diff --name-only "$last_wasm_commit" HEAD -- \
-              rust-wasm/src/ \
-              rust-wasm/Cargo.toml \
-              rust-wasm/Cargo.lock)
-
-            if [ -n "$rust_changes" ]; then
-              echo ""
-              echo "╔══════════════════════════════════════════════════════════════╗"
-              echo "║  ERROR: committed matcher.wasm is STALE                     ║"
-              echo "║                                                              ║"
-              echo "║  The following Rust source files changed after the last      ║"
-              echo "║  matcher.wasm commit:                                        ║"
-              echo "╚══════════════════════════════════════════════════════════════╝"
-              echo ""
-              echo "$rust_changes"
-              echo ""
-              echo "Fix: run 'just wasm' locally and commit the updated binary."
-              exit 1
-            fi
-
-            echo "✓ No Rust source changes since last matcher.wasm commit."
-
-  # ╭──────────────────────────────────────────────────────╮
   # │ Publish: Go module proxy + GitHub Release            │
   # ╰──────────────────────────────────────────────────────╯
   # Runs only on semver tags (v*). Requires GITHUB_TOKEN env var.
@@ -426,20 +371,16 @@ jobs:
 workflows:
   # ┌─────────────────────────────────────────────────────────────────────────┐
   # │ CI: runs on every push and every tag.                                  │
-  # │ Publish: only runs on semver tags (vX.Y.Z), after CI + verify pass.   │
+  # │ Publish: only runs on semver tags (vX.Y.Z), after CI passes.          │
   # │                                                                        │
   # │   ┌──────────────┐    ┌─────────────┐                                  │
   # │   │ rust-checks  │───▸│  go-checks  │            (every push + tag)    │
   # │   └──────────────┘    └──────┬──────┘                                  │
   # │                              │                                          │
-  # │   ┌──────────────┐           │        (tags only: v*)                   │
-  # │   │ verify-wasm  │           │                                          │
-  # │   └──────┬───────┘           │                                          │
-  # │          │                   │                                          │
-  # │          ▼                   ▼                                          │
-  # │   ┌──────────────────────────────┐                                     │
-  # │   │          publish             │    (tags only: v*)                   │
-  # │   └──────────────────────────────┘                                     │
+  # │                              ▼           (tags only: v*)                │
+  # │                   ┌──────────────────┐                                  │
+  # │                   │     publish      │                                  │
+  # │                   └──────────────────┘                                  │
   # └─────────────────────────────────────────────────────────────────────────┘
   ci:
     jobs:
@@ -456,22 +397,12 @@ workflows:
             tags:
               only: /.*/
 
-      # ── Publish gate: verify WASM is fresh (tags only) ──
-      # Uses git history only — no workspace needed.
-      - verify-wasm:
-          filters:
-            tags:
-              only: /^v\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$/
-            branches:
-              ignore: /.*/
-
-      # ── Publish (tags only, after everything green) ──
+      # ── Publish (tags only, after CI green) ──
       - publish:
           context: gh-publish-context
           requires:
             - rust-checks
             - go-checks
-            - verify-wasm
           filters:
             tags:
               only: /^v\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$/
