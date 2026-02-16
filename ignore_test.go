@@ -454,8 +454,8 @@ func TestFilterDirectoryDetection(t *testing.T) {
 	defer m.Close()
 
 	got, err := m.Filter([]string{
-		"build/",    // trailing slash → directory → should be filtered
-		"build",     // no slash → file → should be kept
+		"build/", // trailing slash → directory → should be filtered
+		"build",  // no slash → file → should be kept
 		"src/main.go",
 	})
 	if err != nil {
