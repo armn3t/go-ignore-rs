@@ -69,7 +69,7 @@ func newEngine() (*engine, error) {
 
 	compiled, err := r.CompileModule(ctx, matcherWasm)
 	if err != nil {
-		r.Close(ctx)
+		_ = r.Close(ctx)
 		return nil, fmt.Errorf("ignore: failed to compile wasm module: %w", err)
 	}
 
@@ -120,7 +120,7 @@ func (e *engine) newInstance() (*wasmInstance, error) {
 	if inst.fnAlloc == nil || inst.fnDealloc == nil ||
 		inst.fnCreateMatcher == nil || inst.fnDestroyMatcher == nil ||
 		inst.fnIsMatch == nil || inst.fnBatchFilter == nil {
-		mod.Close(e.ctx)
+		_ = mod.Close(e.ctx)
 		return nil, fmt.Errorf("ignore: wasm module is missing required exports")
 	}
 

@@ -1,0 +1,428 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# go-ignore-rs CI/CD pipeline
+# ──────────────────────────────────────────────────────────────────────────────
+# CI (every push / PR):
+#   rust-checks  – fmt ▸ clippy ▸ unit tests ▸ WASM release build
+#   go-checks    – fmt ▸ vet ▸ golangci-lint ▸ tests (race detector)
+#
+# Publish (only on vX.Y.Z tags):
+#   verify-wasm  – ensures committed matcher.wasm matches freshly-built binary
+#   publish      – warms Go module proxy ▸ creates GitHub Release with assets
+#
+# The Go job depends on rust-checks so it always tests against a freshly-built
+# WASM binary rather than the one committed to the repo.
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ REQUIRED CONTEXT: gh-publish-context                                   │
+# │                                                                        │
+# │   Create this context in CircleCI and add the following env var:       │
+# │                                                                        │
+# │   GITHUB_TOKEN  – GitHub personal access token (or fine-grained token) │
+# │                   with "Contents: read+write" permission on the repo.  │
+# │                   Used by the `gh` CLI to create releases.             │
+# └─────────────────────────────────────────────────────────────────────────┘
+# ──────────────────────────────────────────────────────────────────────────────
+version: 2.1
+
+# ── Parameters ────────────────────────────────────────────────────────────────
+# Change these if you bump your toolchain versions.
+parameters:
+  rust-version:
+    type: string
+    default: "1.93"
+  go-version:
+    type: string
+    default: "1.25"
+  wasm-target:
+    type: string
+    default: "wasm32-wasip1"
+  golangci-lint-version:
+    type: string
+    default: "v2.9.0"
+  gotestsum-version:
+    type: string
+    default: "v1.13.0"
+  module-path:
+    type: string
+    default: "github.com/armn3t/go-ignore-rs"
+
+# ── Jobs ──────────────────────────────────────────────────────────────────────
+jobs:
+  # ╭──────────────────────────────────────────────────────╮
+  # │ Rust: format, lint, test, build WASM                 │
+  # ╰──────────────────────────────────────────────────────╯
+  rust-checks:
+    docker:
+      - image: cimg/rust:<< pipeline.parameters.rust-version >>
+    resource_class: medium
+    environment:
+      CARGO_TERM_COLOR: always
+    steps:
+      - checkout
+
+      # ── Cache: Cargo registry + git db ──
+      - restore_cache:
+          keys:
+            - cargo-registry-v1-{{ checksum "rust-wasm/Cargo.lock" }}
+            - cargo-registry-v1-
+
+      # ── Install WASM target ──
+      - run:
+          name: Add wasm32-wasip1 target
+          command: rustup target add << pipeline.parameters.wasm-target >>
+
+      # ── Format check ──
+      - run:
+          name: Check Rust formatting
+          command: cargo fmt -- --check
+          working_directory: rust-wasm
+
+      # ── Clippy ──
+      - run:
+          name: Run Clippy (deny warnings)
+          command: cargo clippy --target << pipeline.parameters.wasm-target >> -- -D warnings
+          working_directory: rust-wasm
+
+      # ── Unit tests (native, not WASM) ──
+      - run:
+          name: Run Rust tests
+          command: cargo test
+          working_directory: rust-wasm
+
+      # ── Build WASM release binary ──
+      - run:
+          name: Build WASM (release)
+          command: cargo build --target << pipeline.parameters.wasm-target >> --release
+          working_directory: rust-wasm
+
+      # ── Copy WASM to project root (same layout as justfile) ──
+      - run:
+          name: Copy matcher.wasm to project root
+          command: cp rust-wasm/target/<< pipeline.parameters.wasm-target >>/release/matcher.wasm .
+
+      # ── Save caches ──
+      - save_cache:
+          key: cargo-registry-v1-{{ checksum "rust-wasm/Cargo.lock" }}
+          paths:
+            - ~/.cargo/registry
+            - ~/.cargo/git
+            - rust-wasm/target
+
+      # ── Persist the freshly-built WASM for downstream jobs ──
+      - persist_to_workspace:
+          root: .
+          paths:
+            - matcher.wasm
+
+  # ╭──────────────────────────────────────────────────────╮
+  # │ Go: format, vet, lint, test                          │
+  # ╰──────────────────────────────────────────────────────╯
+  go-checks:
+    docker:
+      - image: cimg/go:<< pipeline.parameters.go-version >>
+    resource_class: medium
+    environment:
+      GOFLAGS: ""
+      GOTOOLCHAIN: auto
+    steps:
+      - checkout
+
+      # ── Attach the freshly-built WASM from rust-checks ──
+      - attach_workspace:
+          at: .
+
+      # ── Cache: Go modules ──
+      - restore_cache:
+          keys:
+            - go-mod-v1-{{ checksum "go.sum" }}
+            - go-mod-v1-
+
+      - run:
+          name: Download Go modules
+          command: go mod download
+
+      - save_cache:
+          key: go-mod-v1-{{ checksum "go.sum" }}
+          paths:
+            - ~/go/pkg/mod
+
+      # ── Format check ──
+      - run:
+          name: Check Go formatting
+          command: |
+            unformatted=$(gofmt -l .)
+            if [ -n "$unformatted" ]; then
+              echo "The following files need formatting:"
+              echo "$unformatted"
+              exit 1
+            fi
+            echo "All Go files are properly formatted."
+
+      # ── go vet ──
+      - run:
+          name: Run go vet
+          command: go vet ./...
+
+      # ── golangci-lint ──
+      - run:
+          name: Install golangci-lint << pipeline.parameters.golangci-lint-version >>
+          command: |
+            curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+              | sh -s -- -b "$(go env GOPATH)/bin" "<< pipeline.parameters.golangci-lint-version >>"
+            golangci-lint --version
+
+      - run:
+          name: Run golangci-lint
+          command: golangci-lint run ./...
+
+      # ── Install gotestsum for JUnit output ──
+      - run:
+          name: Install gotestsum << pipeline.parameters.gotestsum-version >>
+          command: go install "gotest.tools/gotestsum@<< pipeline.parameters.gotestsum-version >>"
+
+      # ── Tests with race detector + JUnit XML for CircleCI insights ──
+      - run:
+          name: Run Go tests
+          command: |
+            mkdir -p /tmp/test-results
+            gotestsum \
+              --format standard-verbose \
+              --junitfile /tmp/test-results/go-tests.xml \
+              -- -race -count=1 ./...
+
+      - store_test_results:
+          path: /tmp/test-results
+
+  # ╭──────────────────────────────────────────────────────╮
+  # │ Verify: committed WASM matches freshly-built binary  │
+  # ╰──────────────────────────────────────────────────────╯
+  # This gate prevents publishing a tag where someone changed
+  # Rust source but forgot to rebuild & commit matcher.wasm.
+  verify-wasm:
+    docker:
+      - image: cimg/base:current
+    resource_class: small
+    steps:
+      - checkout
+
+      # ── Record the committed binary's checksum ──
+      - run:
+          name: Checksum committed matcher.wasm
+          command: |
+            echo "Committed matcher.wasm:"
+            sha256sum matcher.wasm | tee /tmp/committed-wasm.sha256
+
+      # ── Overwrite with the freshly-built binary from rust-checks ──
+      - attach_workspace:
+          at: /tmp/workspace
+
+      # ── Compare ──
+      - run:
+          name: Compare committed vs freshly-built WASM
+          command: |
+            echo "Freshly-built matcher.wasm:"
+            sha256sum /tmp/workspace/matcher.wasm | tee /tmp/built-wasm.sha256
+            echo ""
+
+            committed=$(awk '{print $1}' /tmp/committed-wasm.sha256)
+            built=$(awk '{print $1}' /tmp/built-wasm.sha256)
+
+            if [ "$committed" != "$built" ]; then
+              echo ""
+              echo "╔══════════════════════════════════════════════════════════════╗"
+              echo "║  ERROR: committed matcher.wasm is STALE                     ║"
+              echo "║                                                              ║"
+              echo "║  The Rust source has changed but the WASM binary checked     ║"
+              echo "║  into the repo was not rebuilt.                               ║"
+              echo "║                                                              ║"
+              echo "║  Fix: run 'just wasm' locally and commit the updated binary. ║"
+              echo "╚══════════════════════════════════════════════════════════════╝"
+              echo ""
+              echo "  committed: $committed"
+              echo "  built:     $built"
+              exit 1
+            fi
+
+            echo "✓ matcher.wasm is up to date with Rust source."
+
+  # ╭──────────────────────────────────────────────────────╮
+  # │ Publish: Go module proxy + GitHub Release            │
+  # ╰──────────────────────────────────────────────────────╯
+  # Runs only on semver tags (v*). Requires GITHUB_TOKEN env var.
+  publish:
+    docker:
+      - image: cimg/go:<< pipeline.parameters.go-version >>
+    resource_class: small
+    environment:
+      GOTOOLCHAIN: auto
+    steps:
+      - checkout
+
+      - attach_workspace:
+          at: .
+
+      # ── Validate the tag is proper semver ──
+      - run:
+          name: Validate tag format
+          command: |
+            echo "Tag: $CIRCLE_TAG"
+            if ! echo "$CIRCLE_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$'; then
+              echo "ERROR: Tag '$CIRCLE_TAG' is not valid semver (expected vX.Y.Z[-prerelease][+build])"
+              exit 1
+            fi
+            echo "✓ Tag is valid semver."
+
+      # ── Verify go.mod module path is correct ──
+      - run:
+          name: Verify module path
+          command: |
+            module=$(go list -m)
+            echo "Module: $module"
+            expected="<< pipeline.parameters.module-path >>"
+            if [ "$module" != "$expected" ]; then
+              echo "ERROR: go.mod module path '$module' does not match expected '$expected'"
+              exit 1
+            fi
+            echo "✓ Module path is correct."
+
+      # ── Verify go.mod is tidy ──
+      - run:
+          name: Verify go.mod is tidy
+          command: |
+            cp go.mod go.mod.bak
+            cp go.sum go.sum.bak
+            go mod tidy
+            if ! diff -q go.mod go.mod.bak > /dev/null 2>&1 || \
+               ! diff -q go.sum go.sum.bak > /dev/null 2>&1; then
+              echo "ERROR: go.mod/go.sum are not tidy. Run 'go mod tidy' and commit."
+              diff go.mod.bak go.mod || true
+              diff go.sum.bak go.sum || true
+              exit 1
+            fi
+            echo "✓ go.mod and go.sum are tidy."
+
+      # ── Warm the Go module proxy ──
+      - run:
+          name: Warm Go module proxy
+          command: |
+            MODULE="<< pipeline.parameters.module-path >>"
+            echo "Requesting ${MODULE}@${CIRCLE_TAG} from proxy.golang.org ..."
+            echo ""
+
+            # The go list command triggers the proxy to fetch and cache the module.
+            # It may take a moment for the tag to propagate from GitHub to the proxy,
+            # so we retry a few times with backoff.
+            max_attempts=5
+            attempt=1
+            while [ $attempt -le $max_attempts ]; do
+              echo "Attempt $attempt/$max_attempts ..."
+              if GOPROXY=https://proxy.golang.org go list -m "${MODULE}@${CIRCLE_TAG}" 2>/dev/null; then
+                echo ""
+                echo "✓ Module is available on proxy.golang.org"
+                exit 0
+              fi
+              echo "  Not available yet, waiting..."
+              sleep $(( attempt * 5 ))
+              attempt=$(( attempt + 1 ))
+            done
+
+            echo ""
+            echo "⚠ Module not yet available on proxy.golang.org after $max_attempts attempts."
+            echo "  This is normal — the proxy will index it on first 'go get' by any user."
+            echo "  Continuing with the release."
+
+      # ── Install GitHub CLI ──
+      - run:
+          name: Install GitHub CLI
+          command: |
+            # Use the official Debian package from GitHub's apt repo
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+              | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+              | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq gh
+            gh --version
+
+      # ── Create GitHub Release with WASM binary attached ──
+      - run:
+          name: Create GitHub Release
+          command: |
+            echo "Creating GitHub Release for $CIRCLE_TAG ..."
+            echo ""
+
+            # Determine if this is a pre-release (tag contains a hyphen after vX.Y.Z)
+            prerelease_flag=""
+            if echo "$CIRCLE_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+-.+'; then
+              prerelease_flag="--prerelease"
+              echo "  Detected pre-release tag."
+            fi
+
+            # Create release with auto-generated notes and attach the WASM binary
+            gh release create "$CIRCLE_TAG" \
+              matcher.wasm \
+              --repo "<< pipeline.parameters.module-path >>" \
+              --title "$CIRCLE_TAG" \
+              --generate-notes \
+              $prerelease_flag
+
+            echo ""
+            echo "✓ GitHub Release created: https://github.com/<< pipeline.parameters.module-path >>/releases/tag/$CIRCLE_TAG"
+
+# ── Workflows ─────────────────────────────────────────────────────────────────
+workflows:
+  # ┌─────────────────────────────────────────────────────────────────────────┐
+  # │ CI: runs on every push and every tag.                                  │
+  # │ Publish: only runs on semver tags (vX.Y.Z), after CI + verify pass.   │
+  # │                                                                        │
+  # │   ┌──────────────┐    ┌─────────────┐                                  │
+  # │   │ rust-checks  │───▸│  go-checks  │            (every push + tag)    │
+  # │   └──────┬───────┘    └──────┬──────┘                                  │
+  # │          │                   │                                          │
+  # │          ▼                   │        (tags only: v*)                   │
+  # │   ┌──────────────┐          │                                          │
+  # │   │ verify-wasm  │          │                                          │
+  # │   └──────┬───────┘          │                                          │
+  # │          │                   │                                          │
+  # │          ▼                   ▼                                          │
+  # │   ┌──────────────────────────────┐                                     │
+  # │   │          publish             │    (tags only: v*)                   │
+  # │   └──────────────────────────────┘                                     │
+  # └─────────────────────────────────────────────────────────────────────────┘
+  ci:
+    jobs:
+      # ── CI jobs (all pushes + all tags) ──
+      - rust-checks:
+          filters:
+            tags:
+              only: /.*/
+
+      - go-checks:
+          requires:
+            - rust-checks
+          filters:
+            tags:
+              only: /.*/
+
+      # ── Publish gate: verify WASM is fresh (tags only) ──
+      - verify-wasm:
+          requires:
+            - rust-checks
+          filters:
+            tags:
+              only: /^v\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$/
+            branches:
+              ignore: /.*/
+
+      # ── Publish (tags only, after everything green) ──
+      - publish:
+          context: gh-publish-context
+          requires:
+            - rust-checks
+            - go-checks
+            - verify-wasm
+          filters:
+            tags:
+              only: /^v\d+\.\d+\.\d+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$/
+            branches:
+              ignore: /.*/

@@ -46,9 +46,10 @@ fmt: fmt-rust fmt-go
 lint-rust:
     cd {{wasm_src}} && cargo clippy --target {{wasm_target}} -- -D warnings
 
-# lint go code with go vet
+# lint go code with go vet and golangci-lint
 lint-go:
     go vet ./...
+    golangci-lint run ./...
 
 # lint all code
 lint: lint-rust lint-go
@@ -67,6 +68,7 @@ check-go:
     @echo "Checking go formatting..."
     @test -z "$(gofmt -l .)" || (echo "Go files need formatting:"; gofmt -l .; exit 1)
     go vet ./...
+    golangci-lint run ./...
 
 # check all formatting and lint (does not modify files)
 check: check-rust check-go
@@ -96,6 +98,51 @@ test-all: test-rust test
 
 # build everything, check formatting/lint, run all tests
 all: wasm check test-all
+
+# ---------------------------------------------------------------------------
+# Release
+# ---------------------------------------------------------------------------
+
+# create a semver tag and push it to trigger the CI/CD publish workflow
+# usage: just release 0.2.0
+release version:
+    #!/usr/bin/env sh
+    set -e
+    tag="v{{version}}"
+
+    # Validate semver format
+    if ! echo "{{version}}" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?(\+[a-zA-Z0-9.]+)?$'; then
+        echo "ERROR: '{{version}}' is not valid semver (expected X.Y.Z[-prerelease][+build])"
+        exit 1
+    fi
+
+    # Ensure working tree is clean
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "ERROR: working tree is dirty. Commit or stash changes first."
+        exit 1
+    fi
+
+    # Ensure WASM is up to date
+    echo "Rebuilding WASM to verify binary is fresh..."
+    just wasm
+    if [ -n "$(git status --porcelain matcher.wasm)" ]; then
+        echo "ERROR: matcher.wasm changed after rebuild. Commit the updated binary first."
+        exit 1
+    fi
+
+    # Run all checks before tagging
+    echo ""
+    echo "Running full check suite..."
+    just all
+
+    echo ""
+    echo "Creating tag $tag ..."
+    git tag -a "$tag" -m "Release $tag"
+    echo "Pushing tag $tag to origin ..."
+    git push origin "$tag"
+    echo ""
+    echo "✓ Tag $tag pushed. CircleCI will run CI and publish the release."
+    echo "  Track progress: https://app.circleci.com/pipelines/github/armn3t/go-ignore-rs"
 
 # ---------------------------------------------------------------------------
 # Pre-commit hook
