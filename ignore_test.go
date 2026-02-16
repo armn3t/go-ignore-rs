@@ -17,7 +17,7 @@ func TestNewMatcherBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	if m.handle == 0 {
 		t.Fatal("expected non-zero handle")
@@ -32,7 +32,7 @@ func TestNewMatcherEmptyPatterns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher with empty patterns failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	// Empty matcher should not match anything.
 	if m.Match("anything.txt") {
@@ -59,7 +59,7 @@ func TestUseAfterClosePanics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	m.Close()
+	_ = m.Close()
 
 	defer func() {
 		if r := recover(); r == nil {
@@ -78,7 +78,7 @@ func TestMatchStarExtension(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	tests := []struct {
 		path string
@@ -102,7 +102,7 @@ func TestMatchExactFilename(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	if !m.Match("Thumbs.db") {
 		t.Error("should match Thumbs.db")
@@ -120,7 +120,7 @@ func TestMatchDoublestar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	for _, p := range []string{"logs", "a/logs", "a/b/logs"} {
 		if !m.Match(p) {
@@ -134,7 +134,7 @@ func TestMatchQuestionMark(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	if !m.Match("debug0.log") {
 		t.Error("? should match single character")
@@ -152,7 +152,7 @@ func TestMatchCharacterClass(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	if !m.Match("debug5.log") {
 		t.Error("should match digit in range")
@@ -171,7 +171,7 @@ func TestMatchDirTrailingSlashPattern(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	if !m.MatchDir("build") {
 		t.Error("build/ pattern should match directory 'build'")
@@ -186,7 +186,7 @@ func TestMatchDirWithoutTrailingSlash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	if !m.Match("build") {
 		t.Error("'build' pattern should match file")
@@ -205,7 +205,7 @@ func TestMatchResultValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	tests := []struct {
 		path  string
@@ -232,7 +232,7 @@ func TestNegationBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	if !m.Match("debug.log") {
 		t.Error("debug.log should be ignored")
@@ -247,7 +247,7 @@ func TestNegationOrderMatters(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	// Last pattern re-ignores important.log.
 	if !m.Match("important.log") {
@@ -264,7 +264,7 @@ func TestRootedPatternLeadingSlash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	if !m.Match("build") {
 		t.Error("/build should match at root")
@@ -279,7 +279,7 @@ func TestMiddleSlashAnchors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	if !m.Match("doc/frotz") {
 		t.Error("doc/frotz should match")
@@ -304,7 +304,7 @@ func TestCommentsAndBlanks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	if !m.Match("debug.log") {
 		t.Error("should still match *.log")
@@ -319,7 +319,7 @@ func TestEscapedHash(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	if !m.Match("#file") {
 		t.Error("escaped # should match literal #file")
@@ -331,7 +331,7 @@ func TestEscapedBang(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	if !m.Match("!important") {
 		t.Error("escaped ! should match literal !important")
@@ -347,7 +347,7 @@ func TestFilterBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	paths := []string{
 		"src/main.go",
@@ -371,7 +371,7 @@ func TestFilterWithNegation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	got, err := m.Filter([]string{"debug.log", "important.log", "error.log", "src/main.go"})
 	if err != nil {
@@ -387,7 +387,7 @@ func TestFilterAllIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	got, err := m.Filter([]string{"a.txt", "b.txt", "c.txt"})
 	if err != nil {
@@ -403,7 +403,7 @@ func TestFilterParallelAllIgnoredReturnsNil(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	// Use enough paths to trigger multiple workers.
 	paths := make([]string, runtime.NumCPU()*10)
@@ -425,7 +425,7 @@ func TestFilterNoneIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	input := []string{"a.txt", "b.rs", "c.go"}
 	got, err := m.Filter(input)
@@ -441,7 +441,7 @@ func TestFilterEmptyInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	got, err := m.Filter([]string{})
 	if err != nil {
@@ -457,7 +457,7 @@ func TestFilterPreservesOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	got, err := m.Filter([]string{"z.txt", "a.txt", "m.txt", "debug.log", "b.txt"})
 	if err != nil {
@@ -473,7 +473,7 @@ func TestFilterDirectoryDetection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	got, err := m.Filter([]string{
 		"build/", // trailing slash → directory → should be filtered
@@ -502,7 +502,7 @@ func TestFilterLargePatternSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	paths := []string{
 		"src/main.rs",
@@ -551,7 +551,7 @@ func TestFilterParallelBasic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	paths := []string{
 		"src/main.go",
@@ -574,7 +574,7 @@ func TestFilterParallelEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	got, err := m.FilterParallel([]string{})
 	if err != nil {
@@ -590,7 +590,7 @@ func TestFilterParallelPreservesOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	// Generate enough paths to actually trigger multiple workers.
 	numPaths := runtime.NumCPU() * 100
@@ -620,13 +620,13 @@ func TestFilterParallelMatchesFilter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m1.Close()
+	defer func() { _ = m1.Close() }()
 
 	m2, err := NewMatcher(patterns)
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m2.Close()
+	defer func() { _ = m2.Close() }()
 
 	numPaths := runtime.NumCPU() * 200
 	paths := make([]string, numPaths)
@@ -679,7 +679,7 @@ func TestConcurrentMatchers(t *testing.T) {
 				errors <- fmt.Errorf("goroutine %d: NewMatcher failed: %w", id, err)
 				return
 			}
-			defer m.Close()
+			defer func() { _ = m.Close() }()
 
 			matchPath := fmt.Sprintf("file.pattern%d", id)
 			noMatchPath := fmt.Sprintf("file.other%d", id)
@@ -729,7 +729,7 @@ func TestConcurrentFilterParallel(t *testing.T) {
 				errors <- fmt.Errorf("goroutine %d: NewMatcher failed: %w", id, err)
 				return
 			}
-			defer m.Close()
+			defer func() { _ = m.Close() }()
 
 			got, err := m.FilterParallel(paths)
 			if err != nil {
@@ -772,7 +772,7 @@ func TestInstanceReuse(t *testing.T) {
 			t.Errorf("iteration %d: expected %q to match", i, path)
 		}
 
-		m.Close()
+		_ = m.Close()
 	}
 }
 
@@ -805,7 +805,7 @@ func TestRealWorldGitignore(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMatcher failed: %v", err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	// Individual match checks.
 	tests := []struct {
@@ -884,7 +884,7 @@ func BenchmarkNewMatcherClose(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		m.Close()
+		_ = m.Close()
 	}
 }
 
@@ -894,7 +894,7 @@ func BenchmarkMatchSingle(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	b.ResetTimer()
 	for b.Loop() {
@@ -908,7 +908,7 @@ func BenchmarkFilter100(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	paths := make([]string, 100)
 	for i := range paths {
@@ -933,7 +933,7 @@ func BenchmarkFilter10000(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	paths := make([]string, 10000)
 	for i := range paths {
@@ -958,7 +958,7 @@ func BenchmarkFilterParallel10000(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer m.Close()
+	defer func() { _ = m.Close() }()
 
 	paths := make([]string, 10000)
 	for i := range paths {
