@@ -393,8 +393,30 @@ func TestFilterAllIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Filter failed: %v", err)
 	}
-	if len(got) != 0 {
-		t.Errorf("expected empty result, got %v", got)
+	if got != nil {
+		t.Errorf("expected nil when all paths filtered, got %v", got)
+	}
+}
+
+func TestFilterParallelAllIgnoredReturnsNil(t *testing.T) {
+	m, err := NewMatcher([]string{"*"})
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+	defer m.Close()
+
+	// Use enough paths to trigger multiple workers.
+	paths := make([]string, runtime.NumCPU()*10)
+	for i := range paths {
+		paths[i] = fmt.Sprintf("file_%d.txt", i)
+	}
+
+	got, err := m.FilterParallel(paths)
+	if err != nil {
+		t.Fatalf("FilterParallel failed: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil when all paths filtered, got %v (len=%d)", got, len(got))
 	}
 }
 

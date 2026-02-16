@@ -327,6 +327,9 @@ func (m *Matcher) FilterParallel(paths []string) ([]string, error) {
 	for _, r := range resultSlices {
 		total += len(r)
 	}
+	if total == 0 {
+		return nil, nil
+	}
 	merged := make([]string, 0, total)
 	for _, r := range resultSlices {
 		merged = append(merged, r...)
