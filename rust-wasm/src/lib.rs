@@ -28,10 +28,7 @@ static MATCHERS: SingleThreaded<Option<HashMap<u32, Gitignore>>> =
 fn matchers() -> &'static mut HashMap<u32, Gitignore> {
     // SAFETY: WASM is single-threaded; no concurrent access is possible.
     let m = unsafe { &mut *MATCHERS.0.get() };
-    if m.is_none() {
-        *m = Some(HashMap::new());
-    }
-    m.as_mut().unwrap()
+    m.get_or_insert_with(HashMap::new)
 }
 
 // ---------------------------------------------------------------------------
