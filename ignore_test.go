@@ -290,6 +290,57 @@ func TestMiddleSlashAnchors(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Parent-directory matching — children of ignored dirs are ignored
+// ---------------------------------------------------------------------------
+
+func TestMatchChildOfIgnoredDir(t *testing.T) {
+	m, err := NewMatcher([]string{"target/"})
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+	defer func() { _ = m.Close() }()
+
+	// The directory itself is ignored.
+	if !m.MatchDir("target") {
+		t.Error("target/ pattern should match directory 'target'")
+	}
+	// Children of an ignored directory should also be ignored.
+	if !m.Match("target/debug/foo.rs") {
+		t.Error("target/debug/foo.rs should be ignored (parent dir target/ is ignored)")
+	}
+	if !m.Match("target/release/build/output.o") {
+		t.Error("target/release/build/output.o should be ignored (parent dir target/ is ignored)")
+	}
+}
+
+func TestFilterChildrenOfIgnoredDir(t *testing.T) {
+	m, err := NewMatcher([]string{"build/", "node_modules/"})
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+	defer func() { _ = m.Close() }()
+
+	paths := []string{
+		"src/main.go",
+		"build/",
+		"build/output.o",
+		"build/lib/foo.a",
+		"node_modules/",
+		"node_modules/express/index.js",
+		"node_modules/.package-lock.json",
+		"README.md",
+	}
+
+	got, err := m.Filter(paths)
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
+	want := []string{"src/main.go", "README.md"}
+
+	assertStringSliceEqual(t, got, want)
+}
+
+// ---------------------------------------------------------------------------
 // Comments and edge cases
 // ---------------------------------------------------------------------------
 

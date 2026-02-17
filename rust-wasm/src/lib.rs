@@ -28,10 +28,7 @@ static MATCHERS: SingleThreaded<Option<HashMap<u32, Gitignore>>> =
 fn matchers() -> &'static mut HashMap<u32, Gitignore> {
     // SAFETY: WASM is single-threaded; no concurrent access is possible.
     let m = unsafe { &mut *MATCHERS.0.get() };
-    if m.is_none() {
-        *m = Some(HashMap::new());
-    }
-    m.as_mut().unwrap()
+    m.get_or_insert_with(HashMap::new)
 }
 
 // ---------------------------------------------------------------------------
@@ -63,7 +60,7 @@ fn build_matcher(patterns: &str) -> Result<Gitignore, ignore::Error> {
 
 /// Match a single path against a compiled gitignore matcher.
 fn match_path(gitignore: &Gitignore, path: &str, is_dir: bool) -> MatchResult {
-    match gitignore.matched(Path::new(path), is_dir) {
+    match gitignore.matched_path_or_any_parents(Path::new(path), is_dir) {
         ignore::Match::None => MatchResult::None,
         ignore::Match::Ignore(_) => MatchResult::Ignore,
         ignore::Match::Whitelist(_) => MatchResult::Whitelist,
@@ -810,5 +807,76 @@ mod tests {
         assert_eq!(MatchResult::None as i32, 0);
         assert_eq!(MatchResult::Ignore as i32, 1);
         assert_eq!(MatchResult::Whitelist as i32, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Parent-directory matching — matched_path_or_any_parents propagation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parent_match_target_dir_ignores_children() {
+        let gi = matcher(&["target/"]);
+        // The directory itself is ignored
+        assert_eq!(matches_dir(&gi, "target"), MatchResult::Ignore);
+        // Children of an ignored directory are also ignored
+        assert_eq!(matches_file(&gi, "target/foo/bar.rs"), MatchResult::Ignore);
+        assert_eq!(
+            matches_file(&gi, "target/debug/build/output"),
+            MatchResult::Ignore
+        );
+    }
+
+    #[test]
+    fn parent_match_node_modules_ignores_children() {
+        let gi = matcher(&["node_modules/"]);
+        assert_eq!(
+            matches_file(&gi, "node_modules/express/index.js"),
+            MatchResult::Ignore
+        );
+        assert_eq!(
+            matches_file(&gi, "node_modules/.package-lock.json"),
+            MatchResult::Ignore
+        );
+        // Nested node_modules children too
+        assert_eq!(
+            matches_dir(&gi, "packages/app/node_modules"),
+            MatchResult::Ignore
+        );
+        assert_eq!(
+            matches_file(&gi, "packages/app/node_modules/lodash/index.js"),
+            MatchResult::Ignore
+        );
+    }
+
+    #[test]
+    fn parent_match_batch_filter_children_of_ignored_dir() {
+        let gi = matcher(&["build/"]);
+        let result = batch(
+            &gi,
+            &[
+                "src/main.rs",
+                "build/",
+                "build/output.o",
+                "build/lib/foo.a",
+                "README.md",
+            ],
+        );
+        assert_eq!(result, vec!["src/main.rs", "README.md"]);
+    }
+
+    #[test]
+    fn parent_match_negation_can_whitelist_child() {
+        // A negation pattern can re-include a specific file under an ignored
+        // directory when using matched_path_or_any_parents.
+        let gi = matcher(&["build/", "!build/important.txt"]);
+        // The directory itself is ignored
+        assert_eq!(matches_dir(&gi, "build"), MatchResult::Ignore);
+        // The negation pattern whitelists this specific child
+        assert_eq!(
+            matches_file(&gi, "build/important.txt"),
+            MatchResult::Whitelist
+        );
+        // Other children are still ignored
+        assert_eq!(matches_file(&gi, "build/output.o"), MatchResult::Ignore);
     }
 }
