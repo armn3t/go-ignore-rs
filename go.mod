@@ -1,6 +1,6 @@
 module github.com/armn3t/go-ignore-rs
 
-go 1.25.1
+go 1.24.11
 
 require github.com/tetratelabs/wazero v1.11.0
 
