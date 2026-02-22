@@ -29,6 +29,11 @@ var (
 	// to build. Malformed and non-UTF-8 lines are silently skipped, so this
 	// is rare in practice.
 	ErrPatternBuild = errors.New("ignore: failed to compile patterns")
+
+	// ErrHandleExhausted is returned by NewMatcher when the WASM instance has
+	// created more than i32::MAX matchers and the handle space is exhausted.
+	// This is effectively impossible under normal usage.
+	ErrHandleExhausted = errors.New("ignore: max matchers created on this instance")
 )
 
 // Matcher holds a borrowed WASM instance with a compiled gitignore pattern set.
@@ -97,6 +102,8 @@ func createMatcherOnInstance(eng *engine, inst *wasmInstance, patterns string) (
 		return 0, ErrInvalidPath
 	case -3:
 		return 0, ErrPatternBuild
+	case -4:
+		return 0, ErrHandleExhausted
 	default:
 		if code <= 0 {
 			return 0, fmt.Errorf("ignore: create_matcher returned unexpected code: %d", code)

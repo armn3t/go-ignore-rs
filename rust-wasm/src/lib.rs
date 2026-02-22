@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-// NEXT_ID increments monotonically per instance. At u32::MAX wrap, `id as i32`
-// equals -1; the host treats it as a valid handle but is_match/batch_filter
-// reject handle <= 0, so it's orphaned until the instance is destroyed.
+// NEXT_ID increments monotonically per instance. IDs above i32::MAX would cast
+// to negative i32 values; the host interprets those as errors and never calls
+// destroy_matcher, leaking the entry. create_matcher guards against this.
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
 // SAFETY: WASM is single-threaded; no data races are possible. UnsafeCell + a
@@ -106,6 +106,7 @@ pub extern "C" fn dealloc(ptr: i32, size: i32) {
 ///  -1 = patterns_len is negative
 ///  -2 = patterns_ptr is null when patterns_len > 0
 ///  -3 = builder.build() failed
+///  -4 = max matchers created on this instance
 #[no_mangle]
 pub extern "C" fn create_matcher(patterns_ptr: i32, patterns_len: i32) -> i32 {
     if patterns_len < 0 {
@@ -127,6 +128,9 @@ pub extern "C" fn create_matcher(patterns_ptr: i32, patterns_len: i32) -> i32 {
     };
 
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    if id > i32::MAX as u32 {
+        return -4;
+    }
     matchers().insert(id, gitignore);
     id as i32
 }
@@ -749,6 +753,28 @@ mod tests {
         let before = matchers().len();
         matchers().remove(&999999);
         assert_eq!(matchers().len(), before);
+    }
+
+    #[test]
+    fn overflow_id_does_not_insert_matcher() {
+        // Simulate NEXT_ID reaching i32::MAX + 1; create_matcher must not
+        // insert the matcher (which would leak it, since the host never
+        // receives a valid handle to pass to destroy_matcher).
+        let saved = NEXT_ID.swap(i32::MAX as u32 + 1, Ordering::SeqCst);
+        let before = matchers().len();
+
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        // Guard: only insert if the ID fits in a positive i32.
+        if id <= i32::MAX as u32 {
+            matchers().insert(id, build_matcher(b"*.log").unwrap());
+            matchers().remove(&id);
+        }
+
+        let after = matchers().len();
+        NEXT_ID.store(saved, Ordering::SeqCst);
+
+        assert!(id > i32::MAX as u32, "expected overflow ID");
+        assert_eq!(before, after, "overflow must not insert a matcher");
     }
 
     // -----------------------------------------------------------------------
