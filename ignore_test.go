@@ -6,6 +6,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // ---------------------------------------------------------------------------
@@ -197,7 +200,7 @@ func TestMatchDirWithoutTrailingSlash(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// MatchResult — detailed result
+// MatchResult — (bool, error) result
 // ---------------------------------------------------------------------------
 
 func TestMatchResultValues(t *testing.T) {
@@ -208,19 +211,34 @@ func TestMatchResultValues(t *testing.T) {
 	defer func() { _ = m.Close() }()
 
 	tests := []struct {
-		path  string
-		isDir bool
-		want  int
+		path    string
+		isDir   bool
+		ignored bool
 	}{
-		{"debug.log", false, MatchIgnore},
-		{"important.log", false, MatchWhitelist},
-		{"src/main.go", false, MatchNone},
+		{"debug.log", false, true},      // matched ignore pattern
+		{"important.log", false, false}, // matched negation pattern (whitelisted)
+		{"src/main.go", false, false},   // not matched
 	}
 	for _, tc := range tests {
-		if got := m.MatchResult(tc.path, tc.isDir); got != tc.want {
-			t.Errorf("MatchResult(%q, %v) = %d, want %d", tc.path, tc.isDir, got, tc.want)
-		}
+		got, err := m.MatchResult(tc.path, tc.isDir)
+		assert.NoError(t, err, "MatchResult(%q, isDir=%v)", tc.path, tc.isDir)
+		assert.Equal(t, tc.ignored, got, "MatchResult(%q, isDir=%v)", tc.path, tc.isDir)
 	}
+}
+
+func TestMatchResultInvalidUTF8(t *testing.T) {
+	m, err := NewMatcher([]string{"*.log"})
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+	defer func() { _ = m.Close() }()
+
+	// Go strings may contain arbitrary bytes; invalid UTF-8 must surface as ErrPathEncoding.
+	_, err = m.MatchResult("\xff\xfe invalid", false)
+	require.ErrorIs(t, err, ErrPathEncoding)
+
+	// Match (simple API) must return false without panicking on the same input.
+	assert.False(t, m.Match("\xff\xfe invalid"), "Match should return false on error")
 }
 
 // ---------------------------------------------------------------------------
@@ -858,29 +876,27 @@ func TestRealWorldGitignore(t *testing.T) {
 	}
 	defer func() { _ = m.Close() }()
 
-	// Individual match checks.
+	// Individual match checks: true = ignored, false = not ignored (or whitelisted).
 	tests := []struct {
-		path  string
-		isDir bool
-		want  int
+		path    string
+		isDir   bool
+		ignored bool
 	}{
-		{"build", true, MatchIgnore},
-		{"dist", true, MatchIgnore},
-		{"main.o", false, MatchIgnore},
-		{"lib.a", false, MatchIgnore},
-		{"app.log", false, MatchIgnore},
-		{"node_modules", true, MatchIgnore},
-		{"vendor", true, MatchIgnore},
-		{"src/main.rs", false, MatchNone},
-		{"README.md", false, MatchWhitelist},
-		{".gitkeep", false, MatchWhitelist},
+		{"build", true, true},
+		{"dist", true, true},
+		{"main.o", false, true},
+		{"lib.a", false, true},
+		{"app.log", false, true},
+		{"node_modules", true, true},
+		{"vendor", true, true},
+		{"src/main.rs", false, false},
+		{"README.md", false, false}, // whitelisted → not ignored
+		{".gitkeep", false, false},  // whitelisted → not ignored
 	}
 	for _, tc := range tests {
-		got := m.MatchResult(tc.path, tc.isDir)
-		if got != tc.want {
-			t.Errorf("MatchResult(%q, isDir=%v) = %d, want %d",
-				tc.path, tc.isDir, got, tc.want)
-		}
+		got, err := m.MatchResult(tc.path, tc.isDir)
+		assert.NoError(t, err, "MatchResult(%q, isDir=%v)", tc.path, tc.isDir)
+		assert.Equal(t, tc.ignored, got, "MatchResult(%q, isDir=%v)", tc.path, tc.isDir)
 	}
 
 	// Batch filter check.

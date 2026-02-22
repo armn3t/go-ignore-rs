@@ -183,23 +183,33 @@ pub extern "C" fn destroy_matcher(handle: i32) {
 ///   0 = not matched (path is NOT ignored)
 ///   1 = ignored (path matches an ignore pattern)
 ///   2 = whitelisted (path matches a negation pattern like `!keep.log`)
-///  -1 = error (bad handle or invalid input)
+///  -1 = error: handle is not positive (never a valid handle)
+///  -2 = error: path_ptr is null when path_len > 0, or path_len is negative
+///  -3 = error: path bytes are not valid UTF-8
+///  -4 = error: handle not found in the matcher map (may have been destroyed)
 #[no_mangle]
 pub extern "C" fn is_match(handle: i32, path_ptr: i32, path_len: i32, is_dir: i32) -> i32 {
-    if handle <= 0 || path_ptr == 0 || path_len < 0 {
+    if handle <= 0 {
         return -1;
     }
 
-    let bytes = unsafe { std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+    if path_len < 0 || (path_len > 0 && path_ptr == 0) {
+        return -2;
+    }
 
-    let path_str = match std::str::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => return -1,
+    let path_str = if path_len == 0 {
+        ""
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(path_ptr as *const u8, path_len as usize) };
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return -3,
+        }
     };
 
     let gitignore = match matchers().get(&(handle as u32)) {
         Some(gi) => gi,
-        None => return -1,
+        None => return -4,
     };
 
     match_path(gitignore, path_str, is_dir != 0) as i32
@@ -221,7 +231,12 @@ pub extern "C" fn is_match(handle: i32, path_ptr: i32, path_len: i32, is_dir: i3
 ///     bytes 4..8  →  length of the result blob in bytes
 ///     The caller MUST `dealloc(result_ptr, result_len)` after reading.
 ///
-/// Returns: number of kept paths (>= 0) on success, or -1 on error.
+/// Returns: number of kept paths (>= 0) on success, or a negative error code:
+///  -1 = error: handle is not positive (never a valid handle)
+///  -2 = error: result_info_ptr is null
+///  -3 = error: paths_ptr is null when paths_len > 0, or paths_len is negative
+///  -4 = error: paths bytes are not valid UTF-8
+///  -5 = error: handle not found in the matcher map (may have been destroyed)
 ///
 /// If zero paths are kept, result_ptr and result_len are both set to 0 and
 /// the caller should NOT call dealloc.
@@ -232,20 +247,32 @@ pub extern "C" fn batch_filter(
     paths_len: i32,
     result_info_ptr: i32,
 ) -> i32 {
-    if handle <= 0 || paths_ptr == 0 || paths_len < 0 || result_info_ptr == 0 {
+    if handle <= 0 {
         return -1;
     }
 
-    let bytes = unsafe { std::slice::from_raw_parts(paths_ptr as *const u8, paths_len as usize) };
+    if result_info_ptr == 0 {
+        return -2;
+    }
 
-    let text = match std::str::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => return -1,
+    if paths_len < 0 || (paths_len > 0 && paths_ptr == 0) {
+        return -3;
+    }
+
+    let text = if paths_len == 0 {
+        ""
+    } else {
+        let bytes =
+            unsafe { std::slice::from_raw_parts(paths_ptr as *const u8, paths_len as usize) };
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s,
+            Err(_) => return -4,
+        }
     };
 
     let gitignore = match matchers().get(&(handle as u32)) {
         Some(gi) => gi,
-        None => return -1,
+        None => return -5,
     };
 
     let kept = filter_paths(gitignore, text);

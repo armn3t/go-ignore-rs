@@ -9,15 +9,27 @@ import (
 	"sync"
 )
 
-// MatchNone indicates the path did not match any pattern.
-const MatchNone = 0
+// Sentinel errors returned by MatchResult. Each corresponds to a specific
+// negative error code from the WASM is_match export.
+var (
+	// ErrInvalidHandle is returned when the handle argument is not positive.
+	// This should not occur during normal use and indicates a bug.
+	ErrInvalidHandle = errors.New("ignore: matcher handle is not positive (never a valid handle)")
 
-// MatchIgnore indicates the path matched an ignore pattern and should be excluded.
-const MatchIgnore = 1
+	// ErrInvalidPath is returned when the path pointer or length argument
+	// sent to WASM is invalid (null pointer with non-zero length, or negative
+	// length). This should not occur during normal Go usage.
+	ErrInvalidPath = errors.New("ignore: path argument has a null pointer or negative length")
 
-// MatchWhitelist indicates the path matched a negation pattern (e.g. !keep.log)
-// and should be kept.
-const MatchWhitelist = 2
+	// ErrPathEncoding is returned when the path bytes are not valid UTF-8.
+	// Go strings may contain arbitrary bytes; pass only valid UTF-8 paths.
+	ErrPathEncoding = errors.New("ignore: path is not valid UTF-8")
+
+	// ErrHandleNotFound is returned when the handle is positive but not
+	// registered in the matcher map. This typically means the Matcher was
+	// already closed before MatchResult was called.
+	ErrHandleNotFound = errors.New("ignore: matcher handle not found (may have been destroyed)")
+)
 
 // Matcher holds a borrowed WASM instance with a compiled set of gitignore-style
 // patterns. It is NOT safe for concurrent use — each goroutine should create its
@@ -111,35 +123,41 @@ func destroyMatcherOnInstance(eng *engine, inst *wasmInstance, handle uint32) {
 // For matching directory paths, use MatchDir instead. For checking large numbers
 // of paths, prefer Filter or FilterParallel which use batch FFI.
 //
-// On an internal WASM error, Match returns false (not ignored). This means errors
-// are indistinguishable from a non-matching result at this API level. If your
-// use case requires detecting WASM errors, call MatchResult directly and check
-// for a return value of -1.
+// On any error (including WASM errors or invalid UTF-8 in the path), Match
+// returns false. Use MatchResult if you need to distinguish between "not
+// ignored" and an error condition.
 func (m *Matcher) Match(path string) bool {
-	return m.MatchResult(path, false) == MatchIgnore
+	matched, _ := m.MatchResult(path, false)
+	return matched
 }
 
 // MatchDir reports whether the given directory path is ignored by the compiled
 // patterns.
 //
-// On an internal WASM error, MatchDir returns false (not ignored). See Match
-// for details on error handling.
+// On any error, MatchDir returns false. Use MatchResult if you need to
+// distinguish between "not ignored" and an error condition.
 func (m *Matcher) MatchDir(path string) bool {
-	return m.MatchResult(path, true) == MatchIgnore
+	matched, _ := m.MatchResult(path, true)
+	return matched
 }
 
-// MatchResult returns the detailed match result for a path:
+// MatchResult reports whether path is ignored and surfaces any WASM error.
 //
-//	MatchNone      (0) = not matched
-//	MatchIgnore    (1) = ignored
-//	MatchWhitelist (2) = whitelisted (negated pattern)
-//	-1                 = error
-func (m *Matcher) MatchResult(path string, isDir bool) int {
+// Return values:
+//
+//	(true,  nil) — path is ignored (matched an ignore pattern)
+//	(false, nil) — path is not ignored (no match, or matched a negation pattern)
+//	(false, err) — a WASM or FFI error occurred; err is one of:
+//	               ErrInvalidHandle, ErrInvalidPath, ErrPathEncoding, ErrHandleNotFound
+//
+// For most callers, Match or MatchDir is simpler. Use MatchResult when you need
+// to distinguish between "not ignored" and "an error occurred".
+func (m *Matcher) MatchResult(path string, isDir bool) (bool, error) {
 	m.mustBeOpen()
 
 	ptr, size, err := m.eng.writeString(m.inst, path)
 	if err != nil {
-		return -1
+		return false, err
 	}
 	defer m.eng.freeBytes(m.inst, ptr, size)
 
@@ -151,10 +169,27 @@ func (m *Matcher) MatchResult(path string, isDir bool) int {
 	results, err := m.inst.fnIsMatch.Call(m.eng.ctx,
 		uint64(m.handle), uint64(ptr), uint64(size), isDirArg)
 	if err != nil {
-		return -1
+		return false, fmt.Errorf("ignore: is_match call failed: %w", err)
 	}
 
-	return int(int32(results[0]))
+	switch int32(results[0]) {
+	case 0: // not matched
+		return false, nil
+	case 1: // ignored
+		return true, nil
+	case 2: // whitelisted (negation pattern)
+		return false, nil
+	case -1:
+		return false, ErrInvalidHandle
+	case -2:
+		return false, ErrInvalidPath
+	case -3:
+		return false, ErrPathEncoding
+	case -4:
+		return false, ErrHandleNotFound
+	default:
+		return false, fmt.Errorf("ignore: is_match returned unexpected code: %d", int32(results[0]))
+	}
 }
 
 // Filter returns only the paths from the input slice that are NOT ignored by
@@ -203,8 +238,21 @@ func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths
 	}
 
 	count := int32(results[0])
-	if count == -1 {
-		return nil, fmt.Errorf("ignore: batch_filter returned error (invalid handle or input)")
+	switch count {
+	case -1:
+		return nil, ErrInvalidHandle
+	case -2:
+		return nil, fmt.Errorf("ignore: batch_filter: null result info pointer (internal error)")
+	case -3:
+		return nil, ErrInvalidPath
+	case -4:
+		return nil, ErrPathEncoding
+	case -5:
+		return nil, ErrHandleNotFound
+	default:
+		if count < 0 {
+			return nil, fmt.Errorf("ignore: batch_filter returned unexpected error code: %d", count)
+		}
 	}
 	if count == 0 {
 		// Legitimate result: all paths were filtered out.
