@@ -6,6 +6,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // ---------------------------------------------------------------------------
@@ -181,6 +184,24 @@ func TestMatchDirTrailingSlashPattern(t *testing.T) {
 	}
 }
 
+func TestMatchTrailingSlashConsistencyWithFilter(t *testing.T) {
+	// A trailing "/" in the path should be treated as a directory by both
+	// Match and Filter — MatchResult strips the slash and forces isDir=true.
+	m, err := NewMatcher([]string{"build/"})
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+	defer func() { _ = m.Close() }()
+
+	assert.True(t, m.Match("build/"), "Match('build/') should match dir-only pattern")
+
+	kept, err := m.Filter([]string{"build/"})
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
+	assert.Empty(t, kept, "Filter should ignore 'build/'")
+}
+
 func TestMatchDirWithoutTrailingSlash(t *testing.T) {
 	m, err := NewMatcher([]string{"build"})
 	if err != nil {
@@ -197,7 +218,7 @@ func TestMatchDirWithoutTrailingSlash(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// MatchResult — detailed result
+// MatchResult — (bool, error) result
 // ---------------------------------------------------------------------------
 
 func TestMatchResultValues(t *testing.T) {
@@ -208,19 +229,34 @@ func TestMatchResultValues(t *testing.T) {
 	defer func() { _ = m.Close() }()
 
 	tests := []struct {
-		path  string
-		isDir bool
-		want  int
+		path    string
+		isDir   bool
+		ignored bool
 	}{
-		{"debug.log", false, MatchIgnore},
-		{"important.log", false, MatchWhitelist},
-		{"src/main.go", false, MatchNone},
+		{"debug.log", false, true},      // matched ignore pattern
+		{"important.log", false, false}, // matched negation pattern (whitelisted)
+		{"src/main.go", false, false},   // not matched
 	}
 	for _, tc := range tests {
-		if got := m.MatchResult(tc.path, tc.isDir); got != tc.want {
-			t.Errorf("MatchResult(%q, %v) = %d, want %d", tc.path, tc.isDir, got, tc.want)
-		}
+		got, err := m.MatchResult(tc.path, tc.isDir)
+		assert.NoError(t, err, "MatchResult(%q, isDir=%v)", tc.path, tc.isDir)
+		assert.Equal(t, tc.ignored, got, "MatchResult(%q, isDir=%v)", tc.path, tc.isDir)
 	}
+}
+
+func TestMatchResultInvalidUTF8(t *testing.T) {
+	m, err := NewMatcher([]string{"*.log"})
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+	defer func() { _ = m.Close() }()
+
+	// Go strings may contain arbitrary bytes; invalid UTF-8 must surface as ErrPathEncoding.
+	_, err = m.MatchResult("\xff\xfe invalid", false)
+	require.ErrorIs(t, err, ErrPathEncoding)
+
+	// Match (simple API) must return false without panicking on the same input.
+	assert.False(t, m.Match("\xff\xfe invalid"), "Match should return false on error")
 }
 
 // ---------------------------------------------------------------------------
@@ -806,8 +842,52 @@ func TestConcurrentFilterParallel(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Instance pooling — verify instances are reused
+// Instance pooling — verify instances are reused and tainted ones are discarded
 // ---------------------------------------------------------------------------
+
+func TestTaintedInstanceDiscarded(t *testing.T) {
+	eng, err := getEngine()
+	require.NoError(t, err)
+
+	inst, err := eng.getInstance()
+	require.NoError(t, err)
+
+	// Mark tainted directly and return to pool — it must be closed, not pooled.
+	inst.tainted = true
+	eng.putInstance(inst)
+
+	// Engine must still be functional: a fresh instance is allocated as needed.
+	m, err := NewMatcher([]string{"*.log"})
+	require.NoError(t, err)
+	defer func() { _ = m.Close() }()
+	assert.True(t, m.Match("test.log"))
+}
+
+func TestCallErrorTaintsInstance(t *testing.T) {
+	eng, err := getEngine()
+	require.NoError(t, err)
+
+	inst, err := eng.getInstance()
+	require.NoError(t, err)
+
+	// Close the module so that the next Call returns a wazero-level error.
+	_ = inst.mod.Close(eng.ctx)
+
+	// writeString calls fnAlloc.Call — this must fail and set tainted.
+	_, _, werr := eng.writeString(inst, "*.log")
+	assert.Error(t, werr)
+	assert.True(t, inst.tainted)
+
+	// putInstance must close/discard it (mod.Close on an already-closed module
+	// is idempotent in wazero).
+	eng.putInstance(inst)
+
+	// Engine must still be functional.
+	m, err := NewMatcher([]string{"*.log"})
+	require.NoError(t, err)
+	defer func() { _ = m.Close() }()
+	assert.True(t, m.Match("test.log"))
+}
 
 func TestInstanceReuse(t *testing.T) {
 	// Create and close multiple matchers sequentially.
@@ -858,29 +938,27 @@ func TestRealWorldGitignore(t *testing.T) {
 	}
 	defer func() { _ = m.Close() }()
 
-	// Individual match checks.
+	// Individual match checks: true = ignored, false = not ignored (or whitelisted).
 	tests := []struct {
-		path  string
-		isDir bool
-		want  int
+		path    string
+		isDir   bool
+		ignored bool
 	}{
-		{"build", true, MatchIgnore},
-		{"dist", true, MatchIgnore},
-		{"main.o", false, MatchIgnore},
-		{"lib.a", false, MatchIgnore},
-		{"app.log", false, MatchIgnore},
-		{"node_modules", true, MatchIgnore},
-		{"vendor", true, MatchIgnore},
-		{"src/main.rs", false, MatchNone},
-		{"README.md", false, MatchWhitelist},
-		{".gitkeep", false, MatchWhitelist},
+		{"build", true, true},
+		{"dist", true, true},
+		{"main.o", false, true},
+		{"lib.a", false, true},
+		{"app.log", false, true},
+		{"node_modules", true, true},
+		{"vendor", true, true},
+		{"src/main.rs", false, false},
+		{"README.md", false, false}, // whitelisted → not ignored
+		{".gitkeep", false, false},  // whitelisted → not ignored
 	}
 	for _, tc := range tests {
-		got := m.MatchResult(tc.path, tc.isDir)
-		if got != tc.want {
-			t.Errorf("MatchResult(%q, isDir=%v) = %d, want %d",
-				tc.path, tc.isDir, got, tc.want)
-		}
+		got, err := m.MatchResult(tc.path, tc.isDir)
+		assert.NoError(t, err, "MatchResult(%q, isDir=%v)", tc.path, tc.isDir)
+		assert.Equal(t, tc.ignored, got, "MatchResult(%q, isDir=%v)", tc.path, tc.isDir)
 	}
 
 	// Batch filter check.

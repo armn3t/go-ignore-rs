@@ -15,13 +15,17 @@ import (
 //go:embed matcher.wasm
 var matcherWasm []byte
 
-// wasmInstance wraps a single wazero module instance with cached function
-// references. Each instance has its own linear memory and is NOT safe for
-// concurrent use.
+// wasmInstance wraps a wazero module instance with cached function references.
+// Each instance has its own linear memory and is NOT safe for concurrent use.
 type wasmInstance struct {
 	mod api.Module
+	// tainted is set when a wazero Call itself returns a Go error (indicating a
+	// WASM trap or runtime fault). This is distinct from a Rust function
+	// returning a negative i32 error code, which is a normal, safe return path.
+	// After a trap, linear memory state is undefined, so the instance must be
+	// closed and discarded rather than returned to the pool.
+	tainted bool
 
-	// Cached exported function references — avoids map lookup on every call.
 	fnAlloc          api.Function
 	fnDealloc        api.Function
 	fnCreateMatcher  api.Function
@@ -30,17 +34,15 @@ type wasmInstance struct {
 	fnBatchFilter    api.Function
 }
 
-// engine is the package-level singleton that holds the compiled WASM module
-// and a pool of bare instances ready for use.
+// engine is the package-level singleton holding the compiled WASM module and
+// a pool of bare instances ready for use.
 type engine struct {
 	runtime  wazero.Runtime
 	compiled wazero.CompiledModule
 	pool     sync.Pool
 	ctx      context.Context
 
-	// instanceCounter provides unique names for module instances.
-	// wazero requires unique names when multiple instances coexist
-	// under the same runtime.
+	// instanceCounter generates unique module names (wazero requires them).
 	instanceCounter atomic.Uint64
 }
 
@@ -50,8 +52,7 @@ var (
 	engineErr    error
 )
 
-// getEngine returns the package-level engine singleton, initializing it on
-// first call. The WASM module is compiled once and reused for all instances.
+// getEngine returns the singleton engine, compiling the WASM module on first call.
 func getEngine() (*engine, error) {
 	engineOnce.Do(func() {
 		globalEngine, engineErr = newEngine()
@@ -64,7 +65,6 @@ func newEngine() (*engine, error) {
 
 	r := wazero.NewRuntime(ctx)
 
-	// WASI is required because we compiled with wasm32-wasip1.
 	wasi_snapshot_preview1.MustInstantiate(ctx, r)
 
 	compiled, err := r.CompileModule(ctx, matcherWasm)
@@ -82,9 +82,7 @@ func newEngine() (*engine, error) {
 	e.pool.New = func() any {
 		inst, err := e.newInstance()
 		if err != nil {
-			// sync.Pool.New cannot return errors, so we return nil and
-			// the caller (getInstance) will detect it and create directly.
-			return nil
+			return nil // getInstance will retry directly on nil
 		}
 		return inst
 	}
@@ -108,7 +106,6 @@ func (e *engine) newInstance() (*wasmInstance, error) {
 
 	inst := &wasmInstance{mod: mod}
 
-	// Cache all exported function references.
 	inst.fnAlloc = mod.ExportedFunction("alloc")
 	inst.fnDealloc = mod.ExportedFunction("dealloc")
 	inst.fnCreateMatcher = mod.ExportedFunction("create_matcher")
@@ -116,7 +113,6 @@ func (e *engine) newInstance() (*wasmInstance, error) {
 	inst.fnIsMatch = mod.ExportedFunction("is_match")
 	inst.fnBatchFilter = mod.ExportedFunction("batch_filter")
 
-	// Verify all exports exist.
 	if inst.fnAlloc == nil || inst.fnDealloc == nil ||
 		inst.fnCreateMatcher == nil || inst.fnDestroyMatcher == nil ||
 		inst.fnIsMatch == nil || inst.fnBatchFilter == nil {
@@ -127,30 +123,29 @@ func (e *engine) newInstance() (*wasmInstance, error) {
 	return inst, nil
 }
 
-// getInstance retrieves a bare WASM instance from the pool, or creates a new
-// one if the pool is empty.
+// getInstance retrieves a WASM instance from the pool, or creates one if empty.
 func (e *engine) getInstance() (*wasmInstance, error) {
 	if v := e.pool.Get(); v != nil {
 		return v.(*wasmInstance), nil
 	}
-	// Pool.New returned nil (error during creation), try directly.
 	return e.newInstance()
 }
 
-// putInstance returns a bare WASM instance to the pool for reuse.
-// The caller must ensure all matchers on this instance have been destroyed.
-//
-// Note: WASM linear memory grows on demand but never shrinks. An instance that
-// processed a very large path batch will retain its expanded memory footprint
-// when returned to the pool. Under GC pressure sync.Pool evicts idle entries,
-// which reclaims that memory automatically.
+// putInstance returns an instance to the pool. All matchers on it must have
+// been destroyed first. Linear memory grows but never shrinks; the GC reclaims
+// idle instances automatically via sync.Pool eviction.
+// Tainted instances (those that experienced a wazero-level Call error) are
+// closed and discarded instead.
 func (e *engine) putInstance(inst *wasmInstance) {
+	if inst.tainted {
+		_ = inst.mod.Close(e.ctx)
+		return
+	}
 	e.pool.Put(inst)
 }
 
-// writeString allocates memory in the WASM instance, writes the string into
-// it, and returns the pointer and length. The caller MUST call freeBytes when
-// done with the pointer.
+// writeString allocates WASM memory, writes s into it, and returns ptr+size.
+// The caller must call freeBytes when done.
 func (e *engine) writeString(inst *wasmInstance, s string) (ptr uint32, size uint32, err error) {
 	if len(s) == 0 {
 		return 0, 0, nil
@@ -159,6 +154,7 @@ func (e *engine) writeString(inst *wasmInstance, s string) (ptr uint32, size uin
 	size = uint32(len(s))
 	results, err := inst.fnAlloc.Call(e.ctx, uint64(size))
 	if err != nil {
+		inst.tainted = true
 		return 0, 0, fmt.Errorf("ignore: alloc failed: %w", err)
 	}
 	ptr = uint32(results[0])
@@ -175,7 +171,7 @@ func (e *engine) writeString(inst *wasmInstance, s string) (ptr uint32, size uin
 	return ptr, size, nil
 }
 
-// readBytes reads `size` bytes from the WASM instance's memory at `ptr`.
+// readBytes reads size bytes from WASM memory at ptr.
 func (e *engine) readBytes(inst *wasmInstance, ptr, size uint32) ([]byte, error) {
 	if ptr == 0 || size == 0 {
 		return nil, nil
@@ -185,8 +181,7 @@ func (e *engine) readBytes(inst *wasmInstance, ptr, size uint32) ([]byte, error)
 		return nil, fmt.Errorf("ignore: memory read out of range (ptr=%d, size=%d, mem=%d)",
 			ptr, size, inst.mod.Memory().Size())
 	}
-	// Make a copy — the wazero memory buffer is only valid until the next call.
-	out := make([]byte, len(buf))
+	out := make([]byte, len(buf)) // copy: wazero buffer is only valid until the next call
 	copy(out, buf)
 	return out, nil
 }
@@ -197,6 +192,8 @@ func (e *engine) freeBytes(inst *wasmInstance, ptr, size uint32) {
 		return
 	}
 	// Errors during dealloc are non-fatal — the memory will be reclaimed
-	// when the instance is closed.
-	_, _ = inst.fnDealloc.Call(e.ctx, uint64(ptr), uint64(size))
+	// when the instance is closed. Taint so the instance is not reused.
+	if _, err := inst.fnDealloc.Call(e.ctx, uint64(ptr), uint64(size)); err != nil {
+		inst.tainted = true
+	}
 }

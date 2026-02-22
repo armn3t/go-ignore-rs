@@ -1,0 +1,5 @@
+[test]
+# MATCHERS uses UnsafeCell which is safe in single-threaded WASM but not
+# in a multi-threaded native test runner. Enforce single-threaded execution
+# to match the WASM runtime assumption.
+args = ["--test-threads=1"]

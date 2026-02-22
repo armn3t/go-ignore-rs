@@ -9,44 +9,51 @@ import (
 	"sync"
 )
 
-// MatchNone indicates the path did not match any pattern.
-const MatchNone = 0
+// Sentinel errors corresponding to specific WASM error codes.
+var (
+	// ErrInvalidHandle is returned when the handle is not positive.
+	ErrInvalidHandle = errors.New("ignore: matcher handle is not positive (never a valid handle)")
 
-// MatchIgnore indicates the path matched an ignore pattern and should be excluded.
-const MatchIgnore = 1
+	// ErrInvalidPath is returned when the path pointer or length is invalid.
+	// Should not occur in normal Go usage.
+	ErrInvalidPath = errors.New("ignore: path argument has a null pointer or negative length")
 
-// MatchWhitelist indicates the path matched a negation pattern (e.g. !keep.log)
-// and should be kept.
-const MatchWhitelist = 2
+	// ErrPathEncoding is returned when the path is not valid UTF-8.
+	ErrPathEncoding = errors.New("ignore: path is not valid UTF-8")
 
-// Matcher holds a borrowed WASM instance with a compiled set of gitignore-style
-// patterns. It is NOT safe for concurrent use — each goroutine should create its
-// own Matcher via NewMatcher.
-//
-// Close must be called when the Matcher is no longer needed. This destroys the
-// compiled patterns and returns the WASM instance to the pool for reuse.
+	// ErrHandleNotFound is returned when the handle is positive but not in the
+	// matcher map, typically because the Matcher was already closed.
+	ErrHandleNotFound = errors.New("ignore: matcher handle not found (may have been destroyed)")
+
+	// ErrPatternBuild is returned by NewMatcher when the pattern engine fails
+	// to build. Malformed and non-UTF-8 lines are silently skipped, so this
+	// is rare in practice.
+	ErrPatternBuild = errors.New("ignore: failed to compile patterns")
+
+	// ErrHandleExhausted is returned by NewMatcher when the WASM instance has
+	// created more than i32::MAX matchers and the handle space is exhausted.
+	// This is effectively impossible under normal usage.
+	ErrHandleExhausted = errors.New("ignore: max matchers created on this instance")
+)
+
+// Matcher holds a borrowed WASM instance with a compiled gitignore pattern set.
+// NOT safe for concurrent use. Call Close when done.
 type Matcher struct {
-	eng    *engine
-	inst   *wasmInstance
-	handle uint32
-	// patterns is the newline-joined pattern string passed to NewMatcher. It is
-	// retained so that FilterParallel can compile the same pattern set on each
-	// additional borrowed instance without requiring the caller to pass it again.
-	patterns string
+	eng      *engine
+	inst     *wasmInstance
+	handle   uint32
+	patterns string // retained for FilterParallel workers
 	closed   bool
 }
 
-// NewMatcher compiles gitignore-style patterns into a Matcher. Internally it
-// borrows a WASM instance from the pool and compiles the patterns on it.
+// NewMatcher compiles gitignore-style patterns into a Matcher.
+// Borrows a WASM instance from the pool; caller must call Close when done.
 //
-// The caller must call Close when done.
-//
-// Patterns follow standard .gitignore syntax:
-//   - "*.log"          matches all .log files
-//   - "build/"         matches the build directory
-//   - "!important.log" negates a previous pattern
-//   - Lines starting with # are comments
-//   - Empty lines are ignored
+// Pattern syntax follows standard .gitignore rules:
+//   - "*.log"          glob match
+//   - "build/"         directory only
+//   - "!important.log" negation (whitelist)
+//   - "#comment"       ignored line
 func NewMatcher(patterns []string) (*Matcher, error) {
 	eng, err := getEngine()
 	if err != nil {
@@ -74,9 +81,8 @@ func NewMatcher(patterns []string) (*Matcher, error) {
 	}, nil
 }
 
-// createMatcherOnInstance compiles a newline-joined pattern string on a WASM
-// instance and returns the handle. This is used by both NewMatcher and
-// FilterParallel (for temporary workers).
+// createMatcherOnInstance compiles patterns on inst and returns the handle.
+// Used by NewMatcher and FilterParallel workers.
 func createMatcherOnInstance(eng *engine, inst *wasmInstance, patterns string) (uint32, error) {
 	ptr, size, err := eng.writeString(inst, patterns)
 	if err != nil {
@@ -86,60 +92,68 @@ func createMatcherOnInstance(eng *engine, inst *wasmInstance, patterns string) (
 
 	results, err := inst.fnCreateMatcher.Call(eng.ctx, uint64(ptr), uint64(size))
 	if err != nil {
+		inst.tainted = true
 		return 0, fmt.Errorf("ignore: create_matcher call failed: %w", err)
 	}
 
-	handle := uint32(results[0])
-	if handle == 0 {
-		return 0, fmt.Errorf("ignore: failed to compile patterns (create_matcher returned 0)")
+	code := int32(results[0])
+	switch code {
+	case -1, -2:
+		return 0, ErrInvalidPath
+	case -3:
+		return 0, ErrPatternBuild
+	case -4:
+		return 0, ErrHandleExhausted
+	default:
+		if code <= 0 {
+			return 0, fmt.Errorf("ignore: create_matcher returned unexpected code: %d", code)
+		}
 	}
 
-	return handle, nil
+	return uint32(code), nil
 }
 
-// destroyMatcherOnInstance removes a matcher from a WASM instance's internal
-// state.
 func destroyMatcherOnInstance(eng *engine, inst *wasmInstance, handle uint32) {
 	if handle == 0 {
 		return
 	}
-	_, _ = inst.fnDestroyMatcher.Call(eng.ctx, uint64(handle))
+	if _, err := inst.fnDestroyMatcher.Call(eng.ctx, uint64(handle)); err != nil {
+		inst.tainted = true
+	}
 }
 
-// Match reports whether the given file path is ignored by the compiled patterns.
-//
-// For matching directory paths, use MatchDir instead. For checking large numbers
-// of paths, prefer Filter or FilterParallel which use batch FFI.
-//
-// On an internal WASM error, Match returns false (not ignored). This means errors
-// are indistinguishable from a non-matching result at this API level. If your
-// use case requires detecting WASM errors, call MatchResult directly and check
-// for a return value of -1.
+// Match reports whether path is ignored. Returns false on any error.
+// Use MatchResult to distinguish "not ignored" from an error.
 func (m *Matcher) Match(path string) bool {
-	return m.MatchResult(path, false) == MatchIgnore
+	matched, _ := m.MatchResult(path, false)
+	return matched
 }
 
-// MatchDir reports whether the given directory path is ignored by the compiled
-// patterns.
-//
-// On an internal WASM error, MatchDir returns false (not ignored). See Match
-// for details on error handling.
+// MatchDir reports whether a directory path is ignored. Returns false on any error.
+// Use MatchResult to distinguish "not ignored" from an error.
 func (m *Matcher) MatchDir(path string) bool {
-	return m.MatchResult(path, true) == MatchIgnore
+	matched, _ := m.MatchResult(path, true)
+	return matched
 }
 
-// MatchResult returns the detailed match result for a path:
+// MatchResult reports whether path is ignored and surfaces any error.
 //
-//	MatchNone      (0) = not matched
-//	MatchIgnore    (1) = ignored
-//	MatchWhitelist (2) = whitelisted (negated pattern)
-//	-1                 = error
-func (m *Matcher) MatchResult(path string, isDir bool) int {
+//	(true,  nil) — ignored
+//	(false, nil) — not ignored (no match or negation pattern matched)
+//	(false, err) — ErrInvalidHandle, ErrInvalidPath, ErrPathEncoding, or ErrHandleNotFound
+func (m *Matcher) MatchResult(path string, isDir bool) (bool, error) {
 	m.mustBeOpen()
+
+	// A trailing "/" unambiguously signals a directory; strip it and force
+	// isDir=true so behaviour is consistent with Filter's auto-detection.
+	if strings.HasSuffix(path, "/") {
+		path = path[:len(path)-1]
+		isDir = true
+	}
 
 	ptr, size, err := m.eng.writeString(m.inst, path)
 	if err != nil {
-		return -1
+		return false, err
 	}
 	defer m.eng.freeBytes(m.inst, ptr, size)
 
@@ -151,19 +165,32 @@ func (m *Matcher) MatchResult(path string, isDir bool) int {
 	results, err := m.inst.fnIsMatch.Call(m.eng.ctx,
 		uint64(m.handle), uint64(ptr), uint64(size), isDirArg)
 	if err != nil {
-		return -1
+		m.inst.tainted = true
+		return false, fmt.Errorf("ignore: is_match call failed: %w", err)
 	}
 
-	return int(int32(results[0]))
+	switch int32(results[0]) {
+	case 0: // not matched
+		return false, nil
+	case 1: // ignored
+		return true, nil
+	case 2: // whitelisted (negation pattern)
+		return false, nil
+	case -1:
+		return false, ErrInvalidHandle
+	case -2:
+		return false, ErrInvalidPath
+	case -3:
+		return false, ErrPathEncoding
+	case -4:
+		return false, ErrHandleNotFound
+	default:
+		return false, fmt.Errorf("ignore: is_match returned unexpected code: %d", int32(results[0]))
+	}
 }
 
-// Filter returns only the paths from the input slice that are NOT ignored by
-// the compiled patterns.
-//
-// It uses the batch_filter WASM export under the hood — a single FFI round-trip
-// regardless of how many paths are in the slice.
-//
-// Paths ending with "/" are treated as directories for matching purposes.
+// Filter returns paths that are NOT ignored. Uses a single batch_filter FFI
+// round-trip. Paths ending with "/" are treated as directories.
 func (m *Matcher) Filter(paths []string) ([]string, error) {
 	m.mustBeOpen()
 
@@ -174,8 +201,7 @@ func (m *Matcher) Filter(paths []string) ([]string, error) {
 	return batchFilterOnInstance(m.eng, m.inst, m.handle, paths)
 }
 
-// batchFilterOnInstance runs batch_filter on a specific instance/handle and
-// returns the kept paths. Used by both Filter and FilterParallel workers.
+// batchFilterOnInstance runs batch_filter on inst/handle. Used by Filter and FilterParallel.
 func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths []string) ([]string, error) {
 	blob := strings.Join(paths, "\n")
 
@@ -185,9 +211,9 @@ func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths
 	}
 	defer eng.freeBytes(inst, pathsPtr, pathsSize)
 
-	// Allocate 8 bytes for the result info (result_ptr: i32, result_len: i32).
-	infoResults, err := inst.fnAlloc.Call(eng.ctx, 8)
+	infoResults, err := inst.fnAlloc.Call(eng.ctx, 8) // 8 bytes: result_ptr i32 + result_len i32
 	if err != nil {
+		inst.tainted = true
 		return nil, fmt.Errorf("ignore: failed to allocate result info buffer: %w", err)
 	}
 	infoPtr := uint32(infoResults[0])
@@ -199,19 +225,31 @@ func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths
 	results, err := inst.fnBatchFilter.Call(eng.ctx,
 		uint64(handle), uint64(pathsPtr), uint64(pathsSize), uint64(infoPtr))
 	if err != nil {
+		inst.tainted = true
 		return nil, fmt.Errorf("ignore: batch_filter call failed: %w", err)
 	}
 
 	count := int32(results[0])
-	if count == -1 {
-		return nil, fmt.Errorf("ignore: batch_filter returned error (invalid handle or input)")
+	switch count {
+	case -1:
+		return nil, ErrInvalidHandle
+	case -2:
+		return nil, fmt.Errorf("ignore: batch_filter: null result info pointer (internal error)")
+	case -3:
+		return nil, ErrInvalidPath
+	case -4:
+		return nil, ErrPathEncoding
+	case -5:
+		return nil, ErrHandleNotFound
+	default:
+		if count < 0 {
+			return nil, fmt.Errorf("ignore: batch_filter returned unexpected error code: %d", count)
+		}
 	}
 	if count == 0 {
-		// Legitimate result: all paths were filtered out.
 		return nil, nil
 	}
 
-	// Read result pointer and length from the info buffer.
 	infoBuf, ok := inst.mod.Memory().Read(infoPtr, 8)
 	if !ok {
 		return nil, fmt.Errorf("ignore: failed to read result info from wasm memory (ptr=%d, mem=%d)",
@@ -222,11 +260,9 @@ func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths
 	resultLen := binary.LittleEndian.Uint32(infoBuf[4:8])
 
 	if resultPtr == 0 || resultLen == 0 {
-		// Defensive: count > 0 but no result buffer — treat as error.
 		return nil, fmt.Errorf("ignore: batch_filter reported %d kept paths but result buffer is empty", count)
 	}
 
-	// Read the result blob and free it.
 	resultBytes, err := eng.readBytes(inst, resultPtr, resultLen)
 	eng.freeBytes(inst, resultPtr, resultLen) // always free, even on read error
 	if err != nil {
@@ -236,22 +272,10 @@ func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths
 	return strings.Split(string(resultBytes), "\n"), nil
 }
 
-// FilterParallel returns only the paths that are NOT ignored, using multiple
-// WASM instances in parallel. It splits the path list into runtime.NumCPU()
-// chunks, processes each on a separate WASM instance, and merges results in
-// order.
-//
-// Additional instances are temporarily borrowed from the pool and returned
-// when done. The patterns are compiled independently on each instance.
-//
-// For small path lists (< 10k), the parallelism overhead may exceed the
-// savings. Use Filter for small lists.
-//
-// Note: on each call to FilterParallel, the pattern set is re-compiled on each
-// worker instance (chunks 1..N-1). This compilation cost (~1–10µs per worker)
-// is paid on every call, not just the first. It is negligible compared to the
-// matching time saved on large path lists, but for repeated calls on small lists
-// the overhead accumulates — prefer Filter in that case.
+// FilterParallel returns paths that are NOT ignored, splitting the list across
+// runtime.NumCPU() WASM instances and merging results in order.
+// Patterns are re-compiled on each worker (~1–10µs each); prefer Filter for
+// small lists (< 10k paths) where parallelism overhead outweighs the savings.
 func (m *Matcher) FilterParallel(paths []string) ([]string, error) {
 	m.mustBeOpen()
 
@@ -267,12 +291,10 @@ func (m *Matcher) FilterParallel(paths []string) ([]string, error) {
 		numWorkers = len(paths)
 	}
 
-	// For a single worker, just use the regular Filter path.
 	if numWorkers <= 1 {
 		return m.Filter(paths)
 	}
 
-	// Split paths into chunks.
 	chunkSize := (len(paths) + numWorkers - 1) / numWorkers
 	type chunk struct {
 		paths []string
@@ -286,22 +308,19 @@ func (m *Matcher) FilterParallel(paths []string) ([]string, error) {
 		}
 		chunks = append(chunks, chunk{paths: paths[i:end], index: len(chunks)})
 	}
-	numWorkers = len(chunks) // actual number of chunks may be less
+	numWorkers = len(chunks)
 
-	// Worker state: one slot per chunk for its results and errors.
 	resultSlices := make([][]string, numWorkers)
 	errs := make([]error, numWorkers)
 	var wg sync.WaitGroup
 	wg.Add(numWorkers)
 
-	// Chunk 0 uses the Matcher's own instance.
-	go func() {
+	go func() { // chunk 0 uses the Matcher's own instance
 		defer wg.Done()
 		resultSlices[0], errs[0] = batchFilterOnInstance(m.eng, m.inst, m.handle, chunks[0].paths)
 	}()
 
-	// Chunks 1..N-1 borrow temporary instances from the pool.
-	for i := 1; i < numWorkers; i++ {
+	for i := 1; i < numWorkers; i++ { // chunks 1..N-1 borrow temporary instances
 		go func(idx int) {
 			defer wg.Done()
 
@@ -328,7 +347,6 @@ func (m *Matcher) FilterParallel(paths []string) ([]string, error) {
 
 	wg.Wait()
 
-	// Collect any worker errors.
 	var joinedErr error
 	for _, err := range errs {
 		if err != nil {
@@ -339,7 +357,6 @@ func (m *Matcher) FilterParallel(paths []string) ([]string, error) {
 		return nil, joinedErr
 	}
 
-	// Merge results in order.
 	total := 0
 	for _, r := range resultSlices {
 		total += len(r)
@@ -354,11 +371,8 @@ func (m *Matcher) FilterParallel(paths []string) ([]string, error) {
 	return merged, nil
 }
 
-// Close destroys the compiled matcher and returns the WASM instance to the pool
-// for reuse. Must be called when the Matcher is no longer needed.
-//
-// Calling Close more than once is a no-op. Calling any other method after Close
-// will panic.
+// Close destroys the matcher and returns the WASM instance to the pool.
+// Idempotent; any other method called after Close will panic.
 func (m *Matcher) Close() error {
 	if m.closed {
 		return nil
