@@ -29,6 +29,12 @@ var (
 	// registered in the matcher map. This typically means the Matcher was
 	// already closed before MatchResult was called.
 	ErrHandleNotFound = errors.New("ignore: matcher handle not found (may have been destroyed)")
+
+	// ErrPatternBuild is returned by NewMatcher when the pattern engine fails
+	// to compile the provided patterns. Individual malformed or non-UTF-8 lines
+	// are silently skipped (matching gitignore behaviour), so this error is
+	// rare in practice.
+	ErrPatternBuild = errors.New("ignore: failed to compile patterns")
 )
 
 // Matcher holds a borrowed WASM instance with a compiled set of gitignore-style
@@ -101,12 +107,19 @@ func createMatcherOnInstance(eng *engine, inst *wasmInstance, patterns string) (
 		return 0, fmt.Errorf("ignore: create_matcher call failed: %w", err)
 	}
 
-	handle := uint32(results[0])
-	if handle == 0 {
-		return 0, fmt.Errorf("ignore: failed to compile patterns (create_matcher returned 0)")
+	code := int32(results[0])
+	switch code {
+	case -1, -2:
+		return 0, ErrInvalidPath
+	case -3:
+		return 0, ErrPatternBuild
+	default:
+		if code <= 0 {
+			return 0, fmt.Errorf("ignore: create_matcher returned unexpected code: %d", code)
+		}
 	}
 
-	return handle, nil
+	return uint32(code), nil
 }
 
 // destroyMatcherOnInstance removes a matcher from a WASM instance's internal

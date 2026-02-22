@@ -46,14 +46,17 @@ pub enum MatchResult {
     Whitelist = 2,
 }
 
-/// Build a `Gitignore` matcher from a newline-separated pattern string.
+/// Build a `Gitignore` matcher from a newline-separated pattern byte slice.
 ///
-/// Individual lines that fail to parse are silently skipped, matching the
-/// real gitignore behaviour where one bad line doesn't invalidate the file.
-fn build_matcher(patterns: &str) -> Result<Gitignore, ignore::Error> {
+/// Individual lines that fail to parse or are not valid UTF-8 are silently
+/// skipped, matching the real gitignore behaviour where one bad line doesn't
+/// invalidate the file.
+fn build_matcher(patterns: &[u8]) -> Result<Gitignore, ignore::Error> {
     let mut builder = GitignoreBuilder::new(Path::new("/"));
-    for line in patterns.lines() {
-        let _ = builder.add_line(None, line);
+    for line_bytes in patterns.split(|&b| b == b'\n') {
+        if let Ok(line) = std::str::from_utf8(line_bytes) {
+            let _ = builder.add_line(None, line);
+        }
     }
     builder.build()
 }
@@ -130,31 +133,31 @@ pub extern "C" fn dealloc(ptr: i32, size: i32) {
 /// Create a matcher from newline-separated gitignore patterns stored at
 /// `patterns_ptr` for `patterns_len` bytes in WASM memory.
 ///
-/// Returns a handle ID (> 0) on success, or 0 on error.
+/// Individual lines that are not valid UTF-8 are silently skipped, matching
+/// the same leniency applied to lines that fail pattern parsing.
+///
+/// Returns a handle ID (> 0) on success, or a negative error code:
+///  -1 = error: patterns_len is negative
+///  -2 = error: patterns_ptr is null when patterns_len > 0
+///  -3 = error: pattern compilation failed (builder.build() returned an error)
 #[no_mangle]
 pub extern "C" fn create_matcher(patterns_ptr: i32, patterns_len: i32) -> i32 {
     if patterns_len < 0 {
-        return 0;
+        return -1;
     }
 
-    // Empty patterns (ptr=0, len=0) are valid — produce an empty matcher.
-    let text = if patterns_len == 0 {
-        ""
+    let bytes: &[u8] = if patterns_len == 0 {
+        b""
     } else {
         if patterns_ptr == 0 {
-            return 0;
+            return -2;
         }
-        let bytes =
-            unsafe { std::slice::from_raw_parts(patterns_ptr as *const u8, patterns_len as usize) };
-        match std::str::from_utf8(bytes) {
-            Ok(s) => s,
-            Err(_) => return 0,
-        }
+        unsafe { std::slice::from_raw_parts(patterns_ptr as *const u8, patterns_len as usize) }
     };
 
-    let gitignore = match build_matcher(text) {
+    let gitignore = match build_matcher(bytes) {
         Ok(gi) => gi,
-        Err(_) => return 0,
+        Err(_) => return -3,
     };
 
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
@@ -321,7 +324,7 @@ mod tests {
 
     /// Shorthand: build a matcher from a slice of pattern strings.
     fn matcher(patterns: &[&str]) -> Gitignore {
-        build_matcher(&patterns.join("\n")).expect("patterns should compile")
+        build_matcher(patterns.join("\n").as_bytes()).expect("patterns should compile")
     }
 
     /// Shorthand: match a file path (is_dir = false).
@@ -349,32 +352,32 @@ mod tests {
 
     #[test]
     fn build_empty_patterns() {
-        let gi = build_matcher("").expect("empty patterns should compile");
+        let gi = build_matcher(b"").expect("empty patterns should compile");
         assert!(gi.is_empty());
     }
 
     #[test]
     fn build_single_pattern() {
-        let gi = build_matcher("*.log").expect("should compile");
+        let gi = build_matcher(b"*.log").expect("should compile");
         assert_eq!(gi.num_ignores(), 1);
     }
 
     #[test]
     fn build_multiple_patterns() {
-        let gi = build_matcher("*.log\nbuild/\ntemp*").expect("should compile");
+        let gi = build_matcher(b"*.log\nbuild/\ntemp*").expect("should compile");
         assert_eq!(gi.num_ignores(), 3);
     }
 
     #[test]
     fn build_with_comments_and_blanks() {
-        let gi = build_matcher("# this is a comment\n\n*.log\n\n# another comment\nbuild/")
+        let gi = build_matcher(b"# this is a comment\n\n*.log\n\n# another comment\nbuild/")
             .expect("should compile");
         assert_eq!(gi.num_ignores(), 2);
     }
 
     #[test]
     fn build_with_negation() {
-        let gi = build_matcher("*.log\n!important.log").expect("should compile");
+        let gi = build_matcher(b"*.log\n!important.log").expect("should compile");
         assert_eq!(gi.num_ignores(), 1);
         assert_eq!(gi.num_whitelists(), 1);
     }
@@ -802,7 +805,7 @@ mod tests {
 
     #[test]
     fn store_and_retrieve_matcher() {
-        let gi = build_matcher("*.log").unwrap();
+        let gi = build_matcher(b"*.log").unwrap();
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         matchers().insert(id, gi);
 
