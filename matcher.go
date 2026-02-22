@@ -144,6 +144,13 @@ func (m *Matcher) MatchDir(path string) bool {
 func (m *Matcher) MatchResult(path string, isDir bool) (bool, error) {
 	m.mustBeOpen()
 
+	// A trailing "/" unambiguously signals a directory; strip it and force
+	// isDir=true so behaviour is consistent with Filter's auto-detection.
+	if strings.HasSuffix(path, "/") {
+		path = path[:len(path)-1]
+		isDir = true
+	}
+
 	ptr, size, err := m.eng.writeString(m.inst, path)
 	if err != nil {
 		return false, err

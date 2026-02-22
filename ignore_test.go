@@ -184,6 +184,24 @@ func TestMatchDirTrailingSlashPattern(t *testing.T) {
 	}
 }
 
+func TestMatchTrailingSlashConsistencyWithFilter(t *testing.T) {
+	// A trailing "/" in the path should be treated as a directory by both
+	// Match and Filter — MatchResult strips the slash and forces isDir=true.
+	m, err := NewMatcher([]string{"build/"})
+	if err != nil {
+		t.Fatalf("NewMatcher failed: %v", err)
+	}
+	defer func() { _ = m.Close() }()
+
+	assert.True(t, m.Match("build/"), "Match('build/') should match dir-only pattern")
+
+	kept, err := m.Filter([]string{"build/"})
+	if err != nil {
+		t.Fatalf("Filter failed: %v", err)
+	}
+	assert.Empty(t, kept, "Filter should ignore 'build/'")
+}
+
 func TestMatchDirWithoutTrailingSlash(t *testing.T) {
 	m, err := NewMatcher([]string{"build"})
 	if err != nil {
