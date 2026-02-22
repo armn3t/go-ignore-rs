@@ -87,6 +87,7 @@ func createMatcherOnInstance(eng *engine, inst *wasmInstance, patterns string) (
 
 	results, err := inst.fnCreateMatcher.Call(eng.ctx, uint64(ptr), uint64(size))
 	if err != nil {
+		inst.tainted = true
 		return 0, fmt.Errorf("ignore: create_matcher call failed: %w", err)
 	}
 
@@ -109,7 +110,9 @@ func destroyMatcherOnInstance(eng *engine, inst *wasmInstance, handle uint32) {
 	if handle == 0 {
 		return
 	}
-	_, _ = inst.fnDestroyMatcher.Call(eng.ctx, uint64(handle))
+	if _, err := inst.fnDestroyMatcher.Call(eng.ctx, uint64(handle)); err != nil {
+		inst.tainted = true
+	}
 }
 
 // Match reports whether path is ignored. Returns false on any error.
@@ -148,6 +151,7 @@ func (m *Matcher) MatchResult(path string, isDir bool) (bool, error) {
 	results, err := m.inst.fnIsMatch.Call(m.eng.ctx,
 		uint64(m.handle), uint64(ptr), uint64(size), isDirArg)
 	if err != nil {
+		m.inst.tainted = true
 		return false, fmt.Errorf("ignore: is_match call failed: %w", err)
 	}
 
@@ -195,6 +199,7 @@ func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths
 
 	infoResults, err := inst.fnAlloc.Call(eng.ctx, 8) // 8 bytes: result_ptr i32 + result_len i32
 	if err != nil {
+		inst.tainted = true
 		return nil, fmt.Errorf("ignore: failed to allocate result info buffer: %w", err)
 	}
 	infoPtr := uint32(infoResults[0])
@@ -206,6 +211,7 @@ func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths
 	results, err := inst.fnBatchFilter.Call(eng.ctx,
 		uint64(handle), uint64(pathsPtr), uint64(pathsSize), uint64(infoPtr))
 	if err != nil {
+		inst.tainted = true
 		return nil, fmt.Errorf("ignore: batch_filter call failed: %w", err)
 	}
 

@@ -824,8 +824,52 @@ func TestConcurrentFilterParallel(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Instance pooling — verify instances are reused
+// Instance pooling — verify instances are reused and tainted ones are discarded
 // ---------------------------------------------------------------------------
+
+func TestTaintedInstanceDiscarded(t *testing.T) {
+	eng, err := getEngine()
+	require.NoError(t, err)
+
+	inst, err := eng.getInstance()
+	require.NoError(t, err)
+
+	// Mark tainted directly and return to pool — it must be closed, not pooled.
+	inst.tainted = true
+	eng.putInstance(inst)
+
+	// Engine must still be functional: a fresh instance is allocated as needed.
+	m, err := NewMatcher([]string{"*.log"})
+	require.NoError(t, err)
+	defer func() { _ = m.Close() }()
+	assert.True(t, m.Match("test.log"))
+}
+
+func TestCallErrorTaintsInstance(t *testing.T) {
+	eng, err := getEngine()
+	require.NoError(t, err)
+
+	inst, err := eng.getInstance()
+	require.NoError(t, err)
+
+	// Close the module so that the next Call returns a wazero-level error.
+	_ = inst.mod.Close(eng.ctx)
+
+	// writeString calls fnAlloc.Call — this must fail and set tainted.
+	_, _, werr := eng.writeString(inst, "*.log")
+	assert.Error(t, werr)
+	assert.True(t, inst.tainted)
+
+	// putInstance must close/discard it (mod.Close on an already-closed module
+	// is idempotent in wazero).
+	eng.putInstance(inst)
+
+	// Engine must still be functional.
+	m, err := NewMatcher([]string{"*.log"})
+	require.NoError(t, err)
+	defer func() { _ = m.Close() }()
+	assert.True(t, m.Match("test.log"))
+}
 
 func TestInstanceReuse(t *testing.T) {
 	// Create and close multiple matchers sequentially.

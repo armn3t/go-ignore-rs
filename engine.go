@@ -19,6 +19,12 @@ var matcherWasm []byte
 // Each instance has its own linear memory and is NOT safe for concurrent use.
 type wasmInstance struct {
 	mod api.Module
+	// tainted is set when a wazero Call itself returns a Go error (indicating a
+	// WASM trap or runtime fault). This is distinct from a Rust function
+	// returning a negative i32 error code, which is a normal, safe return path.
+	// After a trap, linear memory state is undefined, so the instance must be
+	// closed and discarded rather than returned to the pool.
+	tainted bool
 
 	fnAlloc          api.Function
 	fnDealloc        api.Function
@@ -128,7 +134,13 @@ func (e *engine) getInstance() (*wasmInstance, error) {
 // putInstance returns an instance to the pool. All matchers on it must have
 // been destroyed first. Linear memory grows but never shrinks; the GC reclaims
 // idle instances automatically via sync.Pool eviction.
+// Tainted instances (those that experienced a wazero-level Call error) are
+// closed and discarded instead.
 func (e *engine) putInstance(inst *wasmInstance) {
+	if inst.tainted {
+		_ = inst.mod.Close(e.ctx)
+		return
+	}
 	e.pool.Put(inst)
 }
 
@@ -142,6 +154,7 @@ func (e *engine) writeString(inst *wasmInstance, s string) (ptr uint32, size uin
 	size = uint32(len(s))
 	results, err := inst.fnAlloc.Call(e.ctx, uint64(size))
 	if err != nil {
+		inst.tainted = true
 		return 0, 0, fmt.Errorf("ignore: alloc failed: %w", err)
 	}
 	ptr = uint32(results[0])
@@ -179,6 +192,8 @@ func (e *engine) freeBytes(inst *wasmInstance, ptr, size uint32) {
 		return
 	}
 	// Errors during dealloc are non-fatal — the memory will be reclaimed
-	// when the instance is closed.
-	_, _ = inst.fnDealloc.Call(e.ctx, uint64(ptr), uint64(size))
+	// when the instance is closed. Taint so the instance is not reused.
+	if _, err := inst.fnDealloc.Call(e.ctx, uint64(ptr), uint64(size)); err != nil {
+		inst.tainted = true
+	}
 }
