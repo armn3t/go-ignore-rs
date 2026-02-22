@@ -4,21 +4,13 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-// NOTE: NEXT_ID is per-instance and increments monotonically for the lifetime of
-// the WASM instance. Wraparound after ~4 billion creates on a single instance is
-// effectively impossible in practice. At the theoretical wrap point, when the
-// counter reaches u32::MAX the returned `id as i32` equals -1. The host (Go) casts
-// this to uint32 and sees a non-zero value, so it treats it as a valid handle. The
-// entry is inserted into MATCHERS, but is_match and batch_filter both reject
-// `handle <= 0`, so that entry is permanently orphaned until the instance is
-// destroyed. The next create after the wrap produces id = 0, which create_matcher
-// returns as 0 and the host correctly treats as an error.
+// NEXT_ID increments monotonically per instance. At u32::MAX wrap, `id as i32`
+// equals -1; the host treats it as a valid handle but is_match/batch_filter
+// reject handle <= 0, so it's orphaned until the instance is destroyed.
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
-// SAFETY: WASM is single-threaded — there is only one thread of execution,
-// so no data races are possible. We wrap in UnsafeCell + a ZST wrapper that
-// implements Sync to satisfy the `static` requirements without pulling in
-// Mutex overhead.
+// SAFETY: WASM is single-threaded; no data races are possible. UnsafeCell + a
+// Sync ZST wrapper satisfies `static` requirements without Mutex overhead.
 struct SingleThreaded<T>(UnsafeCell<T>);
 unsafe impl<T> Sync for SingleThreaded<T> {}
 
@@ -26,31 +18,21 @@ static MATCHERS: SingleThreaded<Option<HashMap<u32, Gitignore>>> =
     SingleThreaded(UnsafeCell::new(None));
 
 fn matchers() -> &'static mut HashMap<u32, Gitignore> {
-    // SAFETY: WASM is single-threaded; no concurrent access is possible.
+    // SAFETY: single-threaded WASM; no concurrent access possible.
     let m = unsafe { &mut *MATCHERS.0.get() };
     m.get_or_insert_with(HashMap::new)
 }
 
-// ---------------------------------------------------------------------------
-// Core logic (testable, no FFI/pointer concerns)
-// ---------------------------------------------------------------------------
-
-/// The result of matching a single path against a gitignore matcher.
+/// Match result for a single path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchResult {
-    /// The path did not match any pattern.
     None = 0,
-    /// The path matched an ignore pattern and should be excluded.
     Ignore = 1,
-    /// The path matched a negation (`!`) pattern and should be kept.
     Whitelist = 2,
 }
 
-/// Build a `Gitignore` matcher from a newline-separated pattern byte slice.
-///
-/// Individual lines that fail to parse or are not valid UTF-8 are silently
-/// skipped, matching the real gitignore behaviour where one bad line doesn't
-/// invalidate the file.
+/// Build a `Gitignore` from a newline-separated pattern byte slice.
+/// Lines that fail to parse or are not valid UTF-8 are silently skipped.
 fn build_matcher(patterns: &[u8]) -> Result<Gitignore, ignore::Error> {
     let mut builder = GitignoreBuilder::new(Path::new("/"));
     for line_bytes in patterns.split(|&b| b == b'\n') {
@@ -61,7 +43,7 @@ fn build_matcher(patterns: &[u8]) -> Result<Gitignore, ignore::Error> {
     builder.build()
 }
 
-/// Match a single path against a compiled gitignore matcher.
+/// Match a path against a compiled gitignore matcher.
 fn match_path(gitignore: &Gitignore, path: &str, is_dir: bool) -> MatchResult {
     match gitignore.matched_path_or_any_parents(Path::new(path), is_dir) {
         ignore::Match::None => MatchResult::None,
@@ -70,11 +52,8 @@ fn match_path(gitignore: &Gitignore, path: &str, is_dir: bool) -> MatchResult {
     }
 }
 
-/// Filter a newline-separated list of paths, returning only those that are
-/// NOT ignored (i.e. `None` or `Whitelist`).
-///
-/// Paths ending in `/` are treated as directories for matching purposes.
-/// Empty lines are skipped.
+/// Filter a newline-separated path list, returning only non-ignored entries.
+/// Paths ending in `/` are treated as directories; empty lines are skipped.
 fn filter_paths<'a>(gitignore: &Gitignore, paths: &'a str) -> Vec<&'a str> {
     let mut kept = Vec::new();
     for line in paths.split('\n') {
@@ -96,12 +75,7 @@ fn filter_paths<'a>(gitignore: &Gitignore, paths: &'a str) -> Vec<&'a str> {
     kept
 }
 
-// ---------------------------------------------------------------------------
-// Memory management exports
-// ---------------------------------------------------------------------------
-
-/// Allocate `size` bytes in WASM linear memory and return the pointer.
-/// The caller (host) owns this memory and must call `dealloc` to free it.
+/// Allocate `size` bytes in WASM linear memory. Caller must call `dealloc`.
 #[no_mangle]
 pub extern "C" fn alloc(size: i32) -> i32 {
     if size <= 0 {
@@ -122,24 +96,16 @@ pub extern "C" fn dealloc(ptr: i32, size: i32) {
     }
     unsafe {
         let _ = Vec::from_raw_parts(ptr as *mut u8, size as usize, size as usize);
-        // Vec is dropped here, freeing the memory
     }
 }
 
-// ---------------------------------------------------------------------------
-// Matcher lifecycle exports
-// ---------------------------------------------------------------------------
-
-/// Create a matcher from newline-separated gitignore patterns stored at
-/// `patterns_ptr` for `patterns_len` bytes in WASM memory.
+/// Create a matcher from newline-separated gitignore patterns in WASM memory.
+/// Non-UTF-8 lines are silently skipped.
 ///
-/// Individual lines that are not valid UTF-8 are silently skipped, matching
-/// the same leniency applied to lines that fail pattern parsing.
-///
-/// Returns a handle ID (> 0) on success, or a negative error code:
-///  -1 = error: patterns_len is negative
-///  -2 = error: patterns_ptr is null when patterns_len > 0
-///  -3 = error: pattern compilation failed (builder.build() returned an error)
+/// Returns a handle (> 0) on success, or:
+///  -1 = patterns_len is negative
+///  -2 = patterns_ptr is null when patterns_len > 0
+///  -3 = builder.build() failed
 #[no_mangle]
 pub extern "C" fn create_matcher(patterns_ptr: i32, patterns_len: i32) -> i32 {
     if patterns_len < 0 {
@@ -165,7 +131,7 @@ pub extern "C" fn create_matcher(patterns_ptr: i32, patterns_len: i32) -> i32 {
     id as i32
 }
 
-/// Destroy a previously created matcher, freeing its resources.
+/// Destroy a previously created matcher.
 #[no_mangle]
 pub extern "C" fn destroy_matcher(handle: i32) {
     if handle <= 0 {
@@ -174,22 +140,13 @@ pub extern "C" fn destroy_matcher(handle: i32) {
     matchers().remove(&(handle as u32));
 }
 
-// ---------------------------------------------------------------------------
-// Single-path matching export
-// ---------------------------------------------------------------------------
-
-/// Test whether a single path matches the patterns in the given matcher.
-///
-/// `is_dir`: pass 1 if the path is a directory, 0 otherwise.
+/// Test whether a path matches the patterns in the given matcher.
+/// `is_dir`: 1 if the path is a directory, 0 otherwise.
 ///
 /// Returns:
-///   0 = not matched (path is NOT ignored)
-///   1 = ignored (path matches an ignore pattern)
-///   2 = whitelisted (path matches a negation pattern like `!keep.log`)
-///  -1 = error: handle is not positive (never a valid handle)
-///  -2 = error: path_ptr is null when path_len > 0, or path_len is negative
-///  -3 = error: path bytes are not valid UTF-8
-///  -4 = error: handle not found in the matcher map (may have been destroyed)
+///   0 = not matched,  1 = ignored,  2 = whitelisted (negation pattern)
+///  -1 = handle not positive,  -2 = null path_ptr or negative path_len
+///  -3 = path not valid UTF-8,  -4 = handle not found
 #[no_mangle]
 pub extern "C" fn is_match(handle: i32, path_ptr: i32, path_len: i32, is_dir: i32) -> i32 {
     if handle <= 0 {
@@ -218,31 +175,14 @@ pub extern "C" fn is_match(handle: i32, path_ptr: i32, path_len: i32, is_dir: i3
     match_path(gitignore, path_str, is_dir != 0) as i32
 }
 
-// ---------------------------------------------------------------------------
-// Batch filtering export
-// ---------------------------------------------------------------------------
-
-/// Filter a newline-separated list of paths through the matcher, keeping only
-/// paths that are NOT ignored (i.e. Match::None or Match::Whitelist).
+/// Filter a newline-separated path list, keeping only non-ignored entries.
+/// `result_info_ptr` points to 8 WASM bytes where the result ptr+len are written;
+/// caller must `dealloc(result_ptr, result_len)` after reading (unless count==0).
 ///
-/// Input:
-///   - `handle`: matcher handle from `create_matcher`
-///   - `paths_ptr` / `paths_len`: newline-separated paths blob in WASM memory
-///   - `result_info_ptr`: pointer to 8 bytes in WASM memory where this function
-///     will write two i32 values:
-///     bytes 0..4  →  pointer to the result blob (newline-separated kept paths)
-///     bytes 4..8  →  length of the result blob in bytes
-///     The caller MUST `dealloc(result_ptr, result_len)` after reading.
-///
-/// Returns: number of kept paths (>= 0) on success, or a negative error code:
-///  -1 = error: handle is not positive (never a valid handle)
-///  -2 = error: result_info_ptr is null
-///  -3 = error: paths_ptr is null when paths_len > 0, or paths_len is negative
-///  -4 = error: paths bytes are not valid UTF-8
-///  -5 = error: handle not found in the matcher map (may have been destroyed)
-///
-/// If zero paths are kept, result_ptr and result_len are both set to 0 and
-/// the caller should NOT call dealloc.
+/// Returns count of kept paths (>= 0), or:
+///  -1 = handle not positive,  -2 = null result_info_ptr
+///  -3 = null paths_ptr or negative paths_len,  -4 = paths not valid UTF-8
+///  -5 = handle not found
 #[no_mangle]
 pub extern "C" fn batch_filter(
     handle: i32,
@@ -285,20 +225,16 @@ pub extern "C" fn batch_filter(
     let count = kept.len() as i32;
 
     if kept.is_empty() {
-        // Write zeros: no result buffer allocated
         result_info[0..4].copy_from_slice(&0i32.to_le_bytes());
         result_info[4..8].copy_from_slice(&0i32.to_le_bytes());
         return 0;
     }
 
-    // Join kept paths with newlines into a result blob
     let result_str = kept.join("\n");
     let result_bytes = result_str.into_bytes();
     let result_len = result_bytes.len();
 
-    // Leak the result buffer so it persists for the caller to read.
-    // Box<[u8]> has the same layout as Vec with len == capacity,
-    // so the caller can dealloc via Vec::from_raw_parts.
+    // Leak the buffer; caller must dealloc via Vec::from_raw_parts.
     let mut result_buf = result_bytes.into_boxed_slice();
     let result_ptr = result_buf.as_mut_ptr();
     std::mem::forget(result_buf);
@@ -309,35 +245,23 @@ pub extern "C" fn batch_filter(
     count
 }
 
-// ---------------------------------------------------------------------------
-// Tests — exercise the core logic functions directly (no FFI / pointer
-// concerns, so these run on any host target via `cargo test`).
-// ---------------------------------------------------------------------------
-
+// Tests exercise core logic directly (no FFI/pointer concerns) and run on any host.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
-
-    /// Shorthand: build a matcher from a slice of pattern strings.
     fn matcher(patterns: &[&str]) -> Gitignore {
         build_matcher(patterns.join("\n").as_bytes()).expect("patterns should compile")
     }
 
-    /// Shorthand: match a file path (is_dir = false).
     fn matches_file(gi: &Gitignore, path: &str) -> MatchResult {
         match_path(gi, path, false)
     }
 
-    /// Shorthand: match a directory path (is_dir = true).
     fn matches_dir(gi: &Gitignore, path: &str) -> MatchResult {
         match_path(gi, path, true)
     }
 
-    /// Run batch filter and return the kept paths as a Vec<&str>.
     fn batch(gi: &Gitignore, paths: &[&str]) -> Vec<String> {
         let input = paths.join("\n");
         filter_paths(gi, &input)
