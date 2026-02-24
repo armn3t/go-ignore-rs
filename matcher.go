@@ -65,7 +65,7 @@ func NewMatcher(patterns []string) (*Matcher, error) {
 		return nil, err
 	}
 
-	joined := strings.Join(patterns, "\n")
+	joined := strings.Join(patterns, "\x00")
 
 	handle, err := createMatcherOnInstance(eng, inst, joined)
 	if err != nil {
@@ -203,7 +203,7 @@ func (m *Matcher) Filter(paths []string) ([]string, error) {
 
 // batchFilterOnInstance runs batch_filter on inst/handle. Used by Filter and FilterParallel.
 func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths []string) ([]string, error) {
-	blob := strings.Join(paths, "\n")
+	blob := strings.Join(paths, "\x00")
 
 	pathsPtr, pathsSize, err := eng.writeString(inst, blob)
 	if err != nil {
@@ -234,13 +234,17 @@ func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths
 	case -1:
 		return nil, ErrInvalidHandle
 	case -2:
-		return nil, fmt.Errorf("ignore: batch_filter: null result info pointer (internal error)")
+		return nil, fmt.Errorf("ignore: batch_filter: invalid result info pointer (internal error)")
 	case -3:
 		return nil, ErrInvalidPath
 	case -4:
 		return nil, ErrPathEncoding
 	case -5:
 		return nil, ErrHandleNotFound
+	case -6:
+		return nil, fmt.Errorf("ignore: batch_filter: result exceeds i32::MAX (internal error)")
+	case -7:
+		return nil, fmt.Errorf("ignore: batch_filter: result_info pointer overflows address space (internal error)")
 	default:
 		if count < 0 {
 			return nil, fmt.Errorf("ignore: batch_filter returned unexpected error code: %d", count)
@@ -269,7 +273,7 @@ func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths
 		return nil, fmt.Errorf("ignore: failed to read batch_filter result from wasm memory: %w", err)
 	}
 
-	return strings.Split(string(resultBytes), "\n"), nil
+	return strings.Split(string(resultBytes), "\x00"), nil
 }
 
 // FilterParallel returns paths that are NOT ignored, splitting the list across

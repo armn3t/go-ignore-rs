@@ -660,3 +660,119 @@ kept := m.FilterParallel(millionsOfPaths)
 - **Directory detection in batch_filter**: Currently `batch_filter` assumes all paths are
   files (`is_dir=false`). Consider a convention (e.g., trailing `/`) or a separate
   `batch_filter_dirs` export.
+
+---
+
+## 15. Instance Pool Limiting
+
+> **Status: planned.** The design is decided; implementation is deferred.
+
+Currently the pool is unbounded (`sync.Pool`). Under heavy concurrent load this can
+create a large number of WASM instances, each consuming ~100–300KB.
+
+### Chosen approach: go-re2 pool with configurable cap
+
+The chosen design is the pool pattern used by
+[go-re2](https://github.com/wasilibs/go-re2), extended with a user-configurable cap.
+
+**Why this over the alternatives considered:**
+
+| Approach | Rejects? | Caps total? | GC eviction? | LIFO? |
+|---|---|---|---|---|
+| Bounded channel (idle only) | No | ❌ No | No | ❌ No (FIFO) |
+| `sync.Pool` + semaphore | No | ✅ Yes | ✅ Yes (bad) | ❌ No |
+| go-re2 (chosen) | No | ✅ Yes | ❌ No | ✅ Yes |
+
+The bounded channel only caps idle instances — 100 simultaneous callers still create
+100 instances. The `sync.Pool` semaphore hybrid caps total instances but inherits
+`sync.Pool`'s GC eviction, which can wipe all pooled instances at once under GC
+pressure and cause a thundering herd of re-instantiations. The go-re2 approach caps
+total instances, retains LIFO reuse (most recently used instance has warm memory), and
+is immune to GC eviction.
+
+**Pool mechanics:**
+
+```
+Get():
+  lock
+  loop:
+    if idle list non-empty → pop (LIFO) and return
+    if total < maxInstances → create new, total++, return
+    cond.Wait()              // releases lock; wakes on Put
+
+Put(inst):
+  lock
+  if tainted → total--, close inst, cond.Signal, return
+  push to front of idle list
+  cond.Signal
+  unlock
+```
+
+Blocking (not erroring) when the cap is reached keeps the caller API simple —
+`NewMatcher` always succeeds unless the WASM itself fails. Tainted instances
+decrement `total`, so capacity is automatically recovered.
+
+**Effective cap:** `min(configured, runtime.NumCPU())` — WASM execution is CPU-bound,
+so more instances than CPU threads yields no throughput benefit regardless of what the
+caller requests. The default is `runtime.NumCPU()`. On an 8-core machine: 8 instances
+× ~200KB = ~1.6MB total pool memory.
+
+**`FilterParallel` interaction:** `FilterParallel` holds `m.inst` (chunk 0) while
+borrowing up to `numCPU-1` additional instances. With a cap of N, workers must be
+limited to `min(numWorkers, maxInstances-1)` to prevent all slots being consumed by
+the calling Matcher's own instance, which would stall workers indefinitely.
+
+---
+
+### API changes required
+
+#### New: `Engine` type and `NewEngine`
+
+```go
+// Engine holds a compiled WASM module and a bounded pool of instances.
+// The zero value is not usable; obtain one via NewEngine.
+type Engine struct { /* unexported fields */ }
+
+// NewEngine creates a new Engine with the given options.
+// The WASM module is compiled once on first call to NewMatcher.
+func NewEngine(opts ...Option) *Engine
+
+// Option configures an Engine.
+type Option func(*engineConfig)
+
+// WithMaxInstances sets the desired maximum number of concurrent WASM instances.
+// The effective cap is min(n, runtime.NumCPU()) — additional instances beyond
+// the CPU count yield no throughput benefit for this CPU-bound workload.
+// Callers that exceed the effective cap block until an instance is returned.
+// Defaults to runtime.NumCPU().
+func WithMaxInstances(n int) Option
+```
+
+#### New: `(*Engine).NewMatcher`
+
+```go
+func (e *Engine) NewMatcher(patterns []string) (*Matcher, error)
+```
+
+Same signature and semantics as the package-level `NewMatcher`. The returned
+`Matcher` holds a reference to the `Engine` it came from and returns its instance
+to that engine's pool on `Close`.
+
+#### Package-level `NewMatcher` — unchanged
+
+The package-level function continues to work, backed by a default engine
+(lazily initialised, `runtime.NumCPU()` cap). Existing callers require no changes.
+
+```go
+// NewMatcher uses the default package-level Engine (NumCPU cap).
+func NewMatcher(patterns []string) (*Matcher, error)
+```
+
+#### Internal changes (not public API)
+
+| Change | Detail |
+|---|---|
+| `engine.pool sync.Pool` removed | Replaced by `mu sync.Mutex`, `cond *sync.Cond`, `maxInstances int`, `total int`, `idle *wasmInstance` |
+| `wasmInstance.next *wasmInstance` added | Intrusive linked list pointer; zero-allocation list traversal |
+| `engine.getInstance` / `putInstance` | Rewritten to use mutex + cond pattern above |
+| `FilterParallel` worker count | Capped to `min(numCPU, eng.maxInstances-1)` |
