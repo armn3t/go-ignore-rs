@@ -4,6 +4,7 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -25,6 +26,8 @@ type wasmInstance struct {
 	// After a trap, linear memory state is undefined, so the instance must be
 	// closed and discarded rather than returned to the pool.
 	tainted bool
+	// next is the intrusive linked-list pointer used by the engine's idle list.
+	next *wasmInstance
 
 	fnAlloc          api.Function
 	fnDealloc        api.Function
@@ -34,60 +37,99 @@ type wasmInstance struct {
 	fnBatchFilter    api.Function
 }
 
-// engine is the package-level singleton holding the compiled WASM module and
-// a pool of bare instances ready for use.
+// engine holds the compiled WASM module and a bounded pool of instances.
 type engine struct {
-	runtime  wazero.Runtime
-	compiled wazero.CompiledModule
-	pool     sync.Pool
-	ctx      context.Context
-
-	// instanceCounter generates unique module names (wazero requires them).
+	ctx             context.Context
 	instanceCounter atomic.Uint64
+
+	// lazy WASM compilation — only the first getInstance call pays the cost.
+	compileOnce sync.Once
+	compileErr  error
+	runtime     wazero.Runtime
+	compiled    wazero.CompiledModule
+
+	// bounded instance pool (go-re2 pattern):
+	//   Get: pop LIFO idle list → create if total < max → cond.Wait
+	//   Put: tainted → close + total-- + Signal; else → push front + Signal
+	mu           sync.Mutex
+	cond         *sync.Cond
+	maxInstances int
+	total        int
+	idle         *wasmInstance
 }
 
-var (
-	globalEngine *engine
-	engineOnce   sync.Once
-	engineErr    error
-)
-
-// getEngine returns the singleton engine, compiling the WASM module on first call.
-func getEngine() (*engine, error) {
-	engineOnce.Do(func() {
-		globalEngine, engineErr = newEngine()
-	})
-	return globalEngine, engineErr
+// engineConfig holds options accumulated by Option functions.
+type engineConfig struct {
+	maxInstances int
 }
 
-func newEngine() (*engine, error) {
-	ctx := context.Background()
+// Option configures an Engine.
+type Option func(*engineConfig)
 
-	r := wazero.NewRuntime(ctx)
-
-	wasi_snapshot_preview1.MustInstantiate(ctx, r)
-
-	compiled, err := r.CompileModule(ctx, matcherWasm)
-	if err != nil {
-		_ = r.Close(ctx)
-		return nil, fmt.Errorf("ignore: failed to compile wasm module: %w", err)
+// WithMaxInstances sets the desired maximum number of concurrent WASM instances.
+// The effective cap is min(n, runtime.NumCPU()) — additional instances beyond
+// the CPU count yield no throughput benefit for this CPU-bound workload.
+// Callers that exceed the effective cap block until an instance is returned.
+// Defaults to runtime.NumCPU().
+func WithMaxInstances(n int) Option {
+	return func(c *engineConfig) {
+		c.maxInstances = n
 	}
+}
 
+// Engine holds a compiled WASM module and a bounded pool of instances.
+// The zero value is not usable; obtain one via NewEngine.
+type Engine struct {
+	e *engine
+}
+
+// NewEngine creates a new Engine with the given options.
+// The WASM module is compiled lazily on the first NewMatcher call.
+func NewEngine(opts ...Option) *Engine {
+	cfg := &engineConfig{maxInstances: runtime.NumCPU()}
+	for _, o := range opts {
+		o(cfg)
+	}
+	max := cfg.maxInstances
+	if max < 1 {
+		max = 1
+	}
+	if numCPU := runtime.NumCPU(); max > numCPU {
+		max = numCPU
+	}
 	e := &engine{
-		runtime:  r,
-		compiled: compiled,
-		ctx:      ctx,
+		ctx:          context.Background(),
+		maxInstances: max,
 	}
+	e.cond = sync.NewCond(&e.mu)
+	return &Engine{e: e}
+}
 
-	e.pool.New = func() any {
-		inst, err := e.newInstance()
+// defaultEngine backs the package-level NewMatcher.
+var defaultEngine = NewEngine()
+
+// getEngine returns the internal *engine of the default package-level Engine.
+// Used by tests that access engine internals directly.
+func getEngine() (*engine, error) {
+	return defaultEngine.e, nil
+}
+
+// ensureCompiled compiles the embedded WASM module on the first call.
+// Subsequent calls are no-ops. Safe for concurrent use.
+func (e *engine) ensureCompiled() error {
+	e.compileOnce.Do(func() {
+		r := wazero.NewRuntime(e.ctx)
+		wasi_snapshot_preview1.MustInstantiate(e.ctx, r)
+		compiled, err := r.CompileModule(e.ctx, matcherWasm)
 		if err != nil {
-			return nil // getInstance will retry directly on nil
+			_ = r.Close(e.ctx)
+			e.compileErr = fmt.Errorf("ignore: failed to compile wasm module: %w", err)
+			return
 		}
-		return inst
-	}
-
-	return e, nil
+		e.runtime = r
+		e.compiled = compiled
+	})
+	return e.compileErr
 }
 
 // newInstance creates a fresh WASM module instance with its own linear memory.
@@ -123,25 +165,58 @@ func (e *engine) newInstance() (*wasmInstance, error) {
 	return inst, nil
 }
 
-// getInstance retrieves a WASM instance from the pool, or creates one if empty.
+// getInstance returns an idle instance (LIFO), creates one if below the cap,
+// or blocks until putInstance signals availability.
 func (e *engine) getInstance() (*wasmInstance, error) {
-	if v := e.pool.Get(); v != nil {
-		return v.(*wasmInstance), nil
+	if err := e.ensureCompiled(); err != nil {
+		return nil, err
 	}
-	return e.newInstance()
+
+	e.mu.Lock()
+	for {
+		// Pop the most-recently-used instance from the idle list.
+		if e.idle != nil {
+			inst := e.idle
+			e.idle = inst.next
+			inst.next = nil
+			e.mu.Unlock()
+			return inst, nil
+		}
+		// Create a new instance if we haven't reached the cap.
+		if e.total < e.maxInstances {
+			e.total++
+			e.mu.Unlock()
+			inst, err := e.newInstance()
+			if err != nil {
+				e.mu.Lock()
+				e.total--
+				e.cond.Signal()
+				e.mu.Unlock()
+				return nil, err
+			}
+			return inst, nil
+		}
+		// Cap reached — wait for a putInstance to signal.
+		e.cond.Wait()
+	}
 }
 
-// putInstance returns an instance to the pool. All matchers on it must have
-// been destroyed first. Linear memory grows but never shrinks; the GC reclaims
-// idle instances automatically via sync.Pool eviction.
-// Tainted instances (those that experienced a wazero-level Call error) are
-// closed and discarded instead.
+// putInstance returns an instance to the idle pool. Tainted instances are
+// closed and their capacity slot is freed. A cond.Signal wakes a waiter
+// in getInstance in either case.
 func (e *engine) putInstance(inst *wasmInstance) {
+	e.mu.Lock()
 	if inst.tainted {
+		e.total--
+		e.mu.Unlock()
 		_ = inst.mod.Close(e.ctx)
+		e.cond.Signal()
 		return
 	}
-	e.pool.Put(inst)
+	inst.next = e.idle
+	e.idle = inst
+	e.cond.Signal()
+	e.mu.Unlock()
 }
 
 // writeString allocates WASM memory, writes s into it, and returns ptr+size.
