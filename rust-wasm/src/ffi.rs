@@ -152,9 +152,9 @@ pub extern "C" fn is_match(handle: i32, path_ptr: i32, path_len: i32, is_dir: i3
         Err(_) => return -3,
     };
 
-    let gitignore = match matchers().get(&(handle as u32)) {
-        Some(gi) => gi,
-        None => return -4,
+    let guard = matchers();
+    let Some(gitignore) = guard.get(&(handle as u32)) else {
+        return -4;
     };
 
     match_path(gitignore, path_str, is_dir != 0) as i32
@@ -193,12 +193,14 @@ pub extern "C" fn batch_filter(
         Err(_) => return -4,
     };
 
-    let gitignore = match matchers().get(&(handle as u32)) {
-        Some(gi) => gi,
-        None => return -5,
+    let kept = {
+        let guard = matchers();
+        let Some(gitignore) = guard.get(&(handle as u32)) else {
+            return -5;
+        };
+        filter_paths(gitignore, text)
+        // guard drops here, releasing the lock
     };
-
-    let kept = filter_paths(gitignore, text);
 
     // SAFETY: result_info_ptr is guaranteed non-null by the guard above;
     // the host always allocates 8 bytes for this output slot.
@@ -278,11 +280,14 @@ mod tests {
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         matchers().insert(id, gi);
 
-        let retrieved = matchers().get(&id).expect("matcher should exist");
-        assert_eq!(
-            match_path(retrieved, "debug.log", false),
-            MatchResult::Ignore
-        );
+        {
+            let guard = matchers();
+            let retrieved = guard.get(&id).expect("matcher should exist");
+            assert_eq!(
+                match_path(retrieved, "debug.log", false),
+                MatchResult::Ignore
+            );
+        }
 
         matchers().remove(&id);
         assert!(matchers().get(&id).is_none());

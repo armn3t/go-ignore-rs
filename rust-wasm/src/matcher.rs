@@ -1,5 +1,4 @@
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
-use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -11,18 +10,40 @@ pub enum MatchResult {
     Whitelist = 2,
 }
 
-// SAFETY: WASM is single-threaded; no data races are possible. UnsafeCell + a
-// Sync ZST wrapper satisfies `static` requirements without Mutex overhead.
+// WASM is single-threaded; use a lock-free UnsafeCell wrapper.
+#[cfg(target_arch = "wasm32")]
+use std::cell::UnsafeCell;
+
+#[cfg(target_arch = "wasm32")]
 struct SingleThreaded<T>(UnsafeCell<T>);
+
+// SAFETY: WASM runtime is single-threaded; no concurrent access is possible.
+#[cfg(target_arch = "wasm32")]
 unsafe impl<T> Sync for SingleThreaded<T> {}
 
+#[cfg(target_arch = "wasm32")]
 static MATCHERS: SingleThreaded<Option<HashMap<u32, Gitignore>>> =
     SingleThreaded(UnsafeCell::new(None));
 
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn matchers() -> &'static mut HashMap<u32, Gitignore> {
     // SAFETY: single-threaded WASM; no concurrent access possible.
     let m = unsafe { &mut *MATCHERS.0.get() };
     m.get_or_insert_with(HashMap::new)
+}
+
+// Non-WASM (e.g. native test builds): use a Mutex-backed map.
+// HashMap::new() is not const, so OnceLock is required for lazy init.
+#[cfg(not(target_arch = "wasm32"))]
+static MATCHERS: std::sync::OnceLock<std::sync::Mutex<HashMap<u32, Gitignore>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn matchers() -> std::sync::MutexGuard<'static, HashMap<u32, Gitignore>> {
+    MATCHERS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .expect("matchers mutex poisoned")
 }
 
 /// Build a `Gitignore` from a newline-separated pattern byte slice.
