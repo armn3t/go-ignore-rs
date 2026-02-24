@@ -86,7 +86,7 @@ pub extern "C" fn dealloc(ptr: i32, size: i32) {
     }
 }
 
-/// Create a matcher from newline-separated gitignore patterns in WASM memory.
+/// Create a matcher from null-byte-separated gitignore patterns in WASM memory.
 /// Non-UTF-8 lines are silently skipped.
 ///
 /// Returns a handle (> 0) on success, or:
@@ -152,15 +152,15 @@ pub extern "C" fn is_match(handle: i32, path_ptr: i32, path_len: i32, is_dir: i3
         Err(_) => return -3,
     };
 
-    let guard = matchers();
-    let Some(gitignore) = guard.get(&(handle as u32)) else {
+    let matchers = matchers();
+    let Some(gitignore) = matchers.get(&(handle as u32)) else {
         return -4;
     };
 
     match_path(gitignore, path_str, is_dir != 0) as i32
 }
 
-/// Filter a newline-separated path list, keeping only non-ignored entries.
+/// Filter a null-byte-separated path list, keeping only non-ignored entries.
 /// `result_info_ptr` points to 8 WASM bytes where the result ptr+len are written;
 /// caller must `dealloc(result_ptr, result_len)` after reading (unless count==0).
 ///
@@ -194,8 +194,8 @@ pub extern "C" fn batch_filter(
     };
 
     let kept = {
-        let guard = matchers();
-        let Some(gitignore) = guard.get(&(handle as u32)) else {
+        let matchers = matchers();
+        let Some(gitignore) = matchers.get(&(handle as u32)) else {
             return -5;
         };
         filter_paths(gitignore, text)
@@ -281,8 +281,8 @@ mod tests {
         matchers().insert(id, gi);
 
         {
-            let guard = matchers();
-            let retrieved = guard.get(&id).expect("matcher should exist");
+            let matchers = matchers();
+            let retrieved = matchers.get(&id).expect("matcher should exist");
             assert_eq!(
                 match_path(retrieved, "debug.log", false),
                 MatchResult::Ignore

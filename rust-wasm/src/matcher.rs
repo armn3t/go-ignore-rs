@@ -46,7 +46,7 @@ pub(crate) fn matchers() -> std::sync::MutexGuard<'static, HashMap<u32, Gitignor
         .expect("matchers mutex poisoned")
 }
 
-/// Build a `Gitignore` from a newline-separated pattern byte slice.
+/// Build a `Gitignore` from a null-byte-separated pattern byte slice.
 /// Lines that fail to parse or are not valid UTF-8 are silently skipped.
 pub(crate) fn build_matcher(patterns: &[u8]) -> Result<Gitignore, ignore::Error> {
     let mut builder = GitignoreBuilder::new(Path::new("/"));
@@ -67,7 +67,7 @@ pub(crate) fn match_path(gitignore: &Gitignore, path: &str, is_dir: bool) -> Mat
     }
 }
 
-/// Filter a newline-separated path list, returning only non-ignored entries.
+/// Filter a null-byte-separated path list, returning only non-ignored entries.
 /// Paths ending in `/` are treated as directories; empty lines are skipped.
 pub(crate) fn filter_paths<'a>(gitignore: &Gitignore, paths: &'a str) -> Vec<&'a str> {
     let mut kept = Vec::new();
@@ -478,7 +478,7 @@ mod tests {
     #[test]
     fn filter_skips_empty_lines() {
         let gi = matcher(&["*.log"]);
-        // Simulate empty lines in the input (would appear as "" between newlines)
+        // Simulate empty entries in the input (would appear as "" between null bytes)
         let input = "a.txt\0\0b.log\0\0c.txt\0";
         let result: Vec<&str> = filter_paths(&gi, input);
         assert_eq!(result, vec!["a.txt", "c.txt"]);
