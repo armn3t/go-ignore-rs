@@ -193,7 +193,7 @@ pub extern "C" fn is_match(handle: i32, path_ptr: i32, path_len: i32, is_dir: i3
 /// Returns count of kept paths (>= 0), or:
 ///  -1 = handle not positive,  -2 = invalid result_info_ptr (null or negative)
 ///  -3 = invalid paths_ptr or negative paths_len,  -4 = paths not valid UTF-8
-///  -5 = handle not found
+///  -5 = handle not found,  -6 = result count or byte length exceeds i32::MAX
 #[no_mangle]
 pub extern "C" fn batch_filter(
     handle: i32,
@@ -235,17 +235,23 @@ pub extern "C" fn batch_filter(
         Err(_) => return -2,
     };
 
-    let count = kept.len() as i32;
-
     if kept.is_empty() {
         result_info[0..4].copy_from_slice(&0i32.to_le_bytes());
         result_info[4..8].copy_from_slice(&0i32.to_le_bytes());
         return 0;
     }
 
+    let count: i32 = match kept.len().try_into() {
+        Ok(n) => n,
+        Err(_) => return -6,
+    };
+
     let result_str = kept.join("\0");
     let result_bytes = result_str.into_bytes();
-    let result_len = result_bytes.len();
+    let result_len: i32 = match result_bytes.len().try_into() {
+        Ok(n) => n,
+        Err(_) => return -6,
+    };
 
     // Leak the buffer; caller must dealloc via Vec::from_raw_parts.
     let mut result_buf = result_bytes.into_boxed_slice();
@@ -253,7 +259,7 @@ pub extern "C" fn batch_filter(
     std::mem::forget(result_buf);
 
     result_info[0..4].copy_from_slice(&(result_ptr as i32).to_le_bytes());
-    result_info[4..8].copy_from_slice(&(result_len as i32).to_le_bytes());
+    result_info[4..8].copy_from_slice(&result_len.to_le_bytes());
 
     count
 }
