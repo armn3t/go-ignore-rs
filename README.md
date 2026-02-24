@@ -12,7 +12,7 @@ requires no locks.
 
 ## Requirements
 
-- Go 1.24.11 or later (uses `go:embed`)
+- Go 1.24 or later (required by wazero v1.x)
 - No CGo, no shared libraries, no runtime file dependencies
 
 ## Installation

@@ -243,6 +243,8 @@ func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths
 		return nil, ErrHandleNotFound
 	case -6:
 		return nil, fmt.Errorf("ignore: batch_filter: result exceeds i32::MAX (internal error)")
+	case -7:
+		return nil, fmt.Errorf("ignore: batch_filter: result_info pointer overflows address space (internal error)")
 	default:
 		if count < 0 {
 			return nil, fmt.Errorf("ignore: batch_filter returned unexpected error code: %d", count)
