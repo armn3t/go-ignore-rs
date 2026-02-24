@@ -46,8 +46,9 @@ type Matcher struct {
 	closed   bool
 }
 
-// NewMatcher compiles gitignore-style patterns into a Matcher.
-// Borrows a WASM instance from the pool; caller must call Close when done.
+// NewMatcher compiles gitignore-style patterns into a Matcher using the
+// default package-level Engine. Borrows a WASM instance from the pool;
+// caller must call Close when done.
 //
 // Pattern syntax follows standard .gitignore rules:
 //   - "*.log"          glob match
@@ -55,26 +56,30 @@ type Matcher struct {
 //   - "!important.log" negation (whitelist)
 //   - "#comment"       ignored line
 func NewMatcher(patterns []string) (*Matcher, error) {
-	eng, err := getEngine()
-	if err != nil {
-		return nil, err
-	}
+	return defaultEngine.NewMatcher(patterns)
+}
 
-	inst, err := eng.getInstance()
+// NewMatcher compiles gitignore-style patterns into a Matcher backed by this
+// Engine. Borrows a WASM instance from the Engine's pool; caller must call
+// Close when done. Blocks if the Engine's instance cap is reached.
+func (eng *Engine) NewMatcher(patterns []string) (*Matcher, error) {
+	e := eng.e
+
+	inst, err := e.getInstance()
 	if err != nil {
 		return nil, err
 	}
 
 	joined := strings.Join(patterns, "\x00")
 
-	handle, err := createMatcherOnInstance(eng, inst, joined)
+	handle, err := createMatcherOnInstance(e, inst, joined)
 	if err != nil {
-		eng.putInstance(inst)
+		e.putInstance(inst)
 		return nil, err
 	}
 
 	return &Matcher{
-		eng:      eng,
+		eng:      e,
 		inst:     inst,
 		handle:   handle,
 		patterns: joined,
@@ -293,6 +298,11 @@ func (m *Matcher) FilterParallel(paths []string) ([]string, error) {
 	}
 	if numWorkers > len(paths) {
 		numWorkers = len(paths)
+	}
+	// The Matcher already occupies one pool slot; cap additional workers to
+	// maxInstances-1 so they can always acquire an instance without deadlock.
+	if cap := m.eng.maxInstances - 1; numWorkers > cap {
+		numWorkers = cap
 	}
 
 	if numWorkers <= 1 {
