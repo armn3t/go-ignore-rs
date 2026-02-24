@@ -29,7 +29,7 @@ pub(crate) fn matchers() -> &'static mut HashMap<u32, Gitignore> {
 /// Lines that fail to parse or are not valid UTF-8 are silently skipped.
 pub(crate) fn build_matcher(patterns: &[u8]) -> Result<Gitignore, ignore::Error> {
     let mut builder = GitignoreBuilder::new(Path::new("/"));
-    for line_bytes in patterns.split(|&b| b == b'\n') {
+    for line_bytes in patterns.split(|&b| b == b'\0') {
         if let Ok(line) = std::str::from_utf8(line_bytes) {
             let _ = builder.add_line(None, line);
         }
@@ -50,7 +50,7 @@ pub(crate) fn match_path(gitignore: &Gitignore, path: &str, is_dir: bool) -> Mat
 /// Paths ending in `/` are treated as directories; empty lines are skipped.
 pub(crate) fn filter_paths<'a>(gitignore: &Gitignore, paths: &'a str) -> Vec<&'a str> {
     let mut kept = Vec::new();
-    for line in paths.split('\n') {
+    for line in paths.split('\0') {
         if line.is_empty() {
             continue;
         }
@@ -74,7 +74,7 @@ mod tests {
     use super::*;
 
     fn matcher(patterns: &[&str]) -> Gitignore {
-        build_matcher(patterns.join("\n").as_bytes()).expect("patterns should compile")
+        build_matcher(patterns.join("\0").as_bytes()).expect("patterns should compile")
     }
 
     fn matches_file(gi: &Gitignore, path: &str) -> MatchResult {
@@ -86,7 +86,7 @@ mod tests {
     }
 
     fn batch(gi: &Gitignore, paths: &[&str]) -> Vec<String> {
-        let input = paths.join("\n");
+        let input = paths.join("\0");
         filter_paths(gi, &input)
             .into_iter()
             .map(String::from)
@@ -111,20 +111,20 @@ mod tests {
 
     #[test]
     fn build_multiple_patterns() {
-        let gi = build_matcher(b"*.log\nbuild/\ntemp*").expect("should compile");
+        let gi = build_matcher(b"*.log\0build/\0temp*").expect("should compile");
         assert_eq!(gi.num_ignores(), 3);
     }
 
     #[test]
     fn build_with_comments_and_blanks() {
-        let gi = build_matcher(b"# this is a comment\n\n*.log\n\n# another comment\nbuild/")
+        let gi = build_matcher(b"# this is a comment\0\0*.log\0\0# another comment\0build/")
             .expect("should compile");
         assert_eq!(gi.num_ignores(), 2);
     }
 
     #[test]
     fn build_with_negation() {
-        let gi = build_matcher(b"*.log\n!important.log").expect("should compile");
+        let gi = build_matcher(b"*.log\0!important.log").expect("should compile");
         assert_eq!(gi.num_ignores(), 1);
         assert_eq!(gi.num_whitelists(), 1);
     }
@@ -458,7 +458,7 @@ mod tests {
     fn filter_skips_empty_lines() {
         let gi = matcher(&["*.log"]);
         // Simulate empty lines in the input (would appear as "" between newlines)
-        let input = "a.txt\n\nb.log\n\nc.txt\n";
+        let input = "a.txt\0\0b.log\0\0c.txt\0";
         let result: Vec<&str> = filter_paths(&gi, input);
         assert_eq!(result, vec!["a.txt", "c.txt"]);
     }

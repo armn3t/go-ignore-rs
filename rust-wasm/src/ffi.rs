@@ -215,7 +215,7 @@ pub extern "C" fn batch_filter(
         return 0;
     }
 
-    let result_str = kept.join("\n");
+    let result_str = kept.join("\0");
     let result_bytes = result_str.into_bytes();
     let result_len = result_bytes.len();
 

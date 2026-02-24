@@ -146,7 +146,7 @@ func TestPointerRoundTripCreateAndMatch(t *testing.T) {
 	require.NoError(t, err)
 	defer eng.putInstance(inst)
 
-	pPtr, pSize, err := eng.writeString(inst, "*.log\nbuild/")
+	pPtr, pSize, err := eng.writeString(inst, "*.log\x00build/")
 	require.NoError(t, err)
 
 	res, err := inst.fnCreateMatcher.Call(eng.ctx, uint64(pPtr), uint64(pSize))
@@ -207,7 +207,7 @@ func TestBatchFilterResultInfoSize(t *testing.T) {
 	require.Positive(t, handle)
 	defer func() { _, _ = inst.fnDestroyMatcher.Call(eng.ctx, uint64(handle)) }()
 
-	bPtr, bSize, err := eng.writeString(inst, "src/main.go\ndebug.log\nREADME.md")
+	bPtr, bSize, err := eng.writeString(inst, "src/main.go\x00debug.log\x00README.md")
 	require.NoError(t, err)
 	defer eng.freeBytes(inst, bPtr, bSize)
 
@@ -236,7 +236,7 @@ func TestBatchFilterResultInfoSize(t *testing.T) {
 
 	resultBytes, err := eng.readBytes(inst, resultPtr, resultLen)
 	require.NoError(t, err)
-	assert.Equal(t, "src/main.go\nREADME.md", string(resultBytes))
+	assert.Equal(t, "src/main.go\x00README.md", string(resultBytes))
 
 	eng.freeBytes(inst, resultPtr, resultLen)
 }
