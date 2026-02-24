@@ -234,7 +234,7 @@ func batchFilterOnInstance(eng *engine, inst *wasmInstance, handle uint32, paths
 	case -1:
 		return nil, ErrInvalidHandle
 	case -2:
-		return nil, fmt.Errorf("ignore: batch_filter: null result info pointer (internal error)")
+		return nil, fmt.Errorf("ignore: batch_filter: invalid result info pointer (internal error)")
 	case -3:
 		return nil, ErrInvalidPath
 	case -4:

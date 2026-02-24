@@ -43,7 +43,7 @@ pub(crate) fn matchers() -> std::sync::MutexGuard<'static, HashMap<u32, Gitignor
     MATCHERS
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
-        .expect("matchers mutex poisoned")
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Build a `Gitignore` from a null-byte-separated pattern byte slice.

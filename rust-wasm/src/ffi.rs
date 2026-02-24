@@ -11,6 +11,7 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 /// Returns `Err` when:
 /// - `len` is negative
 /// - `ptr` is null and `len > 0`
+/// - `ptr` is negative (casts to a large usize; may evade the overflow guard)
 /// - `ptr + len` overflows the address space
 ///
 /// # Safety
@@ -25,6 +26,9 @@ unsafe fn wasm_slice<'a>(ptr: i32, len: i32) -> Result<&'a [u8], &'static str> {
     }
     if ptr == 0 {
         return Err("null pointer");
+    }
+    if ptr < 0 {
+        return Err("negative pointer");
     }
     let ptr = ptr as usize as *const u8;
     // Alignment: always true for u8, but guards against future type changes.
@@ -41,7 +45,8 @@ unsafe fn wasm_slice<'a>(ptr: i32, len: i32) -> Result<&'a [u8], &'static str> {
 /// Read a mutable byte slice from WASM linear memory.
 ///
 /// Returns `Err` when:
-/// - `ptr` is null
+/// - `ptr` is null or negative (negative values cast to a large usize and may
+///   evade the overflow guard)
 /// - `ptr + len` overflows the address space
 ///
 /// # Safety
@@ -49,8 +54,8 @@ unsafe fn wasm_slice<'a>(ptr: i32, len: i32) -> Result<&'a [u8], &'static str> {
 /// WASM linear memory with no other live references to the same range for
 /// the duration of the returned slice's lifetime.
 unsafe fn wasm_slice_mut<'a>(ptr: i32, len: usize) -> Result<&'a mut [u8], &'static str> {
-    if ptr == 0 {
-        return Err("null pointer");
+    if ptr <= 0 {
+        return Err("null or negative pointer");
     }
     let ptr = ptr as usize as *mut u8;
     if ptr.align_offset(std::mem::align_of::<u8>()) != 0 {
@@ -91,7 +96,7 @@ pub extern "C" fn dealloc(ptr: i32, size: i32) {
 ///
 /// Returns a handle (> 0) on success, or:
 ///  -1 = patterns_len is negative
-///  -2 = patterns_ptr is null when patterns_len > 0
+///  -2 = patterns_ptr is null or negative when patterns_len > 0
 ///  -3 = builder.build() failed
 ///  -4 = max matchers created on this instance
 #[no_mangle]
@@ -134,7 +139,7 @@ pub extern "C" fn destroy_matcher(handle: i32) {
 ///
 /// Returns:
 ///   0 = not matched,  1 = ignored,  2 = whitelisted (negation pattern)
-///  -1 = handle not positive,  -2 = null path_ptr or negative path_len
+///  -1 = handle not positive,  -2 = invalid path_ptr (null or negative) or negative path_len
 ///  -3 = path not valid UTF-8,  -4 = handle not found
 #[no_mangle]
 pub extern "C" fn is_match(handle: i32, path_ptr: i32, path_len: i32, is_dir: i32) -> i32 {
@@ -165,8 +170,8 @@ pub extern "C" fn is_match(handle: i32, path_ptr: i32, path_len: i32, is_dir: i3
 /// caller must `dealloc(result_ptr, result_len)` after reading (unless count==0).
 ///
 /// Returns count of kept paths (>= 0), or:
-///  -1 = handle not positive,  -2 = null result_info_ptr
-///  -3 = null paths_ptr or negative paths_len,  -4 = paths not valid UTF-8
+///  -1 = handle not positive,  -2 = invalid result_info_ptr (null or negative)
+///  -3 = invalid paths_ptr or negative paths_len,  -4 = paths not valid UTF-8
 ///  -5 = handle not found
 #[no_mangle]
 pub extern "C" fn batch_filter(
@@ -179,7 +184,7 @@ pub extern "C" fn batch_filter(
         return -1;
     }
 
-    if result_info_ptr == 0 {
+    if result_info_ptr <= 0 {
         return -2;
     }
 
@@ -258,6 +263,23 @@ mod tests {
     fn wasm_slice_null_ptr_with_positive_len_returns_err() {
         assert!(unsafe { wasm_slice(0, 1) }.is_err());
         assert!(unsafe { wasm_slice(0, 100) }.is_err());
+    }
+
+    #[test]
+    fn wasm_slice_negative_ptr_returns_err() {
+        // Negative i32 pointers cast to large usize values and can slip past
+        // the overflow guard (e.g. ptr=-256, len=255 does not overflow u32::MAX
+        // on a 32-bit target). Reject them before the cast.
+        assert!(unsafe { wasm_slice(-1, 1) }.is_err());
+        assert!(unsafe { wasm_slice(-256, 255) }.is_err());
+        assert!(unsafe { wasm_slice(i32::MIN, 1) }.is_err());
+    }
+
+    #[test]
+    fn wasm_slice_mut_negative_ptr_returns_err() {
+        assert!(unsafe { wasm_slice_mut(-1, 1) }.is_err());
+        assert!(unsafe { wasm_slice_mut(-256, 255) }.is_err());
+        assert!(unsafe { wasm_slice_mut(i32::MIN, 1) }.is_err());
     }
 
     // Valid-pointer round-trip tests require a 32-bit address space where
